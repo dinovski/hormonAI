@@ -1,4 +1,5 @@
-# hormonAI  
+![hormonAI](hormonAI.png)
+
 *A compassionate, FAQ-restricted RAG chatbot for adjuvant hormone therapy*
 
 hormonAI is a **proof-of-concept Retrieval-Augmented Generation (RAG) chatbot** built on a curated medical FAQ about **adjuvant hormone therapy for breast cancer**.  
