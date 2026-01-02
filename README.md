@@ -52,7 +52,7 @@ Parses the FAQ document by section and Q/A.
 Builds a hybrid retriever:  
 - FAISS on questions
 - FAISS on Q+A
-- BM25 lexical search
+- BM25 keyword-based retrieval
 ```python
 python ingest_faq.py -l en -d docs/20250613_FAQ_Hormono_EN.docx
 python ingest_faq.py -l fr -d docs/20250613_FAQ_Hormono_FR.docx
@@ -69,7 +69,7 @@ faq_<lang>_qa.pkl           # Parsed FAQ items + metadata
 python chatbot.py -l en
 ```
 
-## Run the chatbot with re-ranking (optional)
+## Run the chatbot with re-ranking
 ```python
 python chatbot.py -l en --rerank
 ```
@@ -80,7 +80,7 @@ ollama run llama3.2
 python chatbot.py -l en --use-llm --llm-provider ollama --ollama-model llama3.2
 ```
 
-## Run the app
+## Run the app (GUI)
 ```python
 streamlit run hormonai_app.py
 ```
