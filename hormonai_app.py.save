@@ -1,0 +1,489 @@
+import os
+import html
+import streamlit as st
+
+from chatbot import (
+    FAQRetriever,
+    chat_once,
+    EMBEDDING_MODEL_NAME,
+)
+
+# ---------- BASIC PAGE CONFIG ----------
+st.set_page_config(
+    page_title="hormonAI – Breast Cancer Support Chatbot",
+    page_icon="💗",
+    layout="centered",
+)
+
+# ---------- GLOBAL STYLES ----------
+st.markdown(
+    """
+    <style>
+    /* Global text color override: warm rose-plum, no black text */
+    * {
+        color: #b26a7c !important;
+    }
+
+    /* Overall page styling */
+    .stApp {
+        background-color: #ffffff;  /* white main area */
+        font-family: "Helvetica Neue", Arial, sans-serif;
+    }
+
+    /* Sidebar background */
+    [data-testid="stSidebar"] {
+        background-color: #ffeef6;  /* warm light pink */
+        border-right: 1px solid #f8d4e5;
+    }
+
+    /* Sidebar headings slightly stronger */
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #a34e68 !important;
+        font-weight: 650;
+    }
+
+    /* Checkbox / radio accent colors */
+    input[type="checkbox"], input[type="radio"] {
+        accent-color: #ff4da6;
+    }
+
+    /* Checkbox/toggle labels in sidebar explicitly */
+    [data-testid="stSidebar"] label {
+        color: #b26a7c !important;
+    }
+
+    /* Base input in sidebar */
+    [data-testid="stSidebar"] input[type="text"] {
+        border-radius: 10px;
+        border: 1px solid #ff9ccc !important;
+        box-shadow: none !important;
+        background-color: #fff9fd !important;
+        color: #b26a7c !important;
+    }
+
+    /* Streamlit selectbox: BaseWeb select container (control area) */
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background-color: #ffdde9 !important;  /* light pink, not black */
+        border-radius: 10px !important;
+        border: 1px solid #ff9ccc !important;
+    }
+
+    /* Streamlit selectbox: value/button text */
+    [data-testid="stSidebar"] .stSelectbox div[role="button"] {
+        background-color: transparent !important;
+        color: #b26a7c !important;
+    }
+
+    /* Any text inside selectbox in sidebar */
+    [data-testid="stSidebar"] .stSelectbox * {
+        color: #b26a7c !important;
+    }
+
+    /* Dropdown list options when open (anywhere) */
+    div[role="listbox"] * {
+        color: #b26a7c !important;
+        background-color: #fff9fd !important;
+    }
+
+    /* Center the header block */
+    .hormonai-header {
+        text-align: center;
+        margin-bottom: 0.75rem;
+    }
+
+    .hormonai-title {
+        font-size: 2.6rem;
+        font-weight: 750;
+        color: #b26a7c !important;
+        margin-bottom: 0.25rem;
+    }
+
+    .hormonai-subtitle {
+        font-size: 1.05rem;
+        color: #bf7a8b !important;
+        margin-bottom: 1.0rem;
+    }
+
+    /* Accent color buttons (Send) */
+    .stButton > button {
+        border-radius: 999px;
+        border: none;
+        padding: 0.55rem 1.4rem;
+        font-weight: 600;
+        cursor: pointer;
+        background-color: #d93f88 !important;          /* tasteful dark pink */
+        background-image: none !important;
+        color: #ffffff !important;                     /* white text */
+        box-shadow: 0 3px 8px rgba(217, 63, 136, 0.35);
+    }
+
+    /* Ensure inner span text stays white despite global * selector */
+    .stButton > button * {
+        color: #ffffff !important;
+    }
+
+    .stButton > button:hover {
+        opacity: 0.96;
+        box-shadow: 0 4px 10px rgba(217, 63, 136, 0.45);
+    }
+
+    /* Chat message bubbles – rounded rectangles with text inside */
+    .chat-bubble-user {
+        background-color: #ffe1ef;                 /* light pink */
+        padding: 0.85rem 1.1rem;
+        border-radius: 18px;                        /* fully rounded rectangle */
+        margin: 0.3rem 0 0.6rem 0;
+        max-width: 75%;
+        margin-left: auto;
+        border: 1px solid #ffb3d2;
+        color: #b26a7c !important;
+        box-shadow: 0 2px 6px rgba(255, 154, 203, 0.25);
+    }
+    .chat-bubble-bot {
+        background-color: #e6faf7;                 /* light teal */
+        padding: 0.85rem 1.1rem;
+        border-radius: 18px;                        /* fully rounded rectangle */
+        margin: 0.3rem 0 0.6rem 0;
+        max-width: 75%;
+        margin-right: auto;
+        border: 1px solid #8ad5c8;
+        color: #8c6474 !important;
+        box-shadow: 0 2px 6px rgba(120, 204, 190, 0.25);
+    }
+    .chat-role {
+        font-size: 0.8rem;
+        color: #bf7a8b !important;
+        margin-bottom: 0.25rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .chat-content {
+        font-size: 0.95rem;
+        line-height: 1.45;
+        color: inherit !important;
+    }
+
+    /* Chat title */
+    .chat-title {
+        font-size: 1.6rem;
+        font-weight: 680;
+        color: #b26a7c !important;
+        margin-top: 0.2rem;
+        margin-bottom: 0.75rem;
+    }
+
+    /* Textarea: dark slate bar, light text */
+    textarea {
+        border-radius: 14px !important;
+        border: 1px solid #4c4f59 !important;
+        box-shadow: 0 0 0 1px rgba(60, 63, 75, 0.4);
+        background-color: #2f3136 !important;  /* dark slate gray */
+        color: #f4f4f7 !important;             /* light text on dark bar */
+    }
+
+    textarea::placeholder {
+        color: #b9bac4 !important;  /* soft light gray */
+        opacity: 1;
+    }
+
+    textarea:focus-visible {
+        outline: none !important;
+        box-shadow: 0 0 0 2px rgba(255, 77, 166, 0.5) !important;
+    }
+
+    /* Small pill tag for "prototype" */
+    .pill {
+        display: inline-block;
+        padding: 0.15rem 0.7rem;
+        border-radius: 999px;
+        background-color: #ffe1ef;
+        color: #ff4da6 !important;
+        font-size: 0.8rem;
+        font-weight: 650;
+        margin-left: 0.4rem;
+        vertical-align: middle;
+    }
+
+    /* About text readability */
+    .about-text {
+        color: #b26a7c !important;
+        line-height: 1.6;
+        font-size: 0.96rem;
+    }
+
+    /* Prompt label */
+    .prompt-label {
+        font-size: 1.0rem;
+        font-weight: 600;
+        color: #a3566c !important;
+        margin-bottom: 0.25rem;
+    }
+
+    /* Expander header: "About hormonAI & safety" */
+    [data-testid="stExpander"] > details > summary {
+        background-color: #fff7fb !important;  /* soft very light pink/white */
+        color: #b26a7c !important;
+        border-radius: 10px !important;
+        border: 1px solid #f3c4d9 !important;
+    }
+
+    /* Chevron/arrow icon in expander */
+    [data-testid="stExpander"] svg path {
+        fill: #b26a7c !important;
+    }
+
+    /* Also cover button-based expander header (for older/newer variants) */
+    [data-testid="stExpander"] button {
+        background-color: #fff7fb !important;
+        color: #b26a7c !important;
+        border-radius: 10px !important;
+        border: 1px solid #f3c4d9 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------- LOGO + TITLE ----------
+with st.container():
+    st.markdown('<div class="hormonai-header">', unsafe_allow_html=True)
+    # Make sure hormonAI.png is in the same folder as this script
+    st.image("hormonAI.png", width=440)
+    st.markdown(
+        """
+        <div class="hormonai-title">
+            hormonAI <span class="pill">prototype</span>
+        </div>
+        <div class="hormonai-subtitle">A breast cancer support chatbot prototype</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------- ABOUT & SAFETY SECTION ----------
+with st.expander("About hormonAI & safety", expanded=True):
+    st.markdown(
+        """
+<div class="about-text">
+
+**What is hormonAI?**
+
+- hormonAI is a *proof-of-concept* chatbot built on top of a written FAQ about adjuvant hormone therapy for breast cancer.
+- It uses retrieval-augmented generation (RAG): for each question, it searches the FAQ and bases its answer on the most relevant entries.
+
+**Very important safety notes**
+
+- hormonAI does **not** replace your oncologist, GP, or healthcare team.
+- It is **not** an emergency service and does not provide personalized medical advice.
+- It should never be used to decide whether to start, stop, or change a treatment.
+- hormonAI is restricted to the content of the FAQ and may say “I don’t know” when a question goes beyond that scope.
+
+Always discuss your situation and any treatment decisions directly with your oncology team.
+
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ---------- SIDEBAR CONTROLS ----------
+st.sidebar.header("Settings")
+
+language = st.sidebar.selectbox(
+    "Language / Langue",
+    options=["en", "fr"],
+    format_func=lambda x: "English" if x == "en" else "Français",
+)
+
+use_llm = st.sidebar.checkbox(
+    "Use LLM for rephrasing (advanced)",
+    value=False,
+    help=(
+        "If disabled, hormonAI answers directly with the FAQ text.\n"
+        "If enabled, the LLM rephrases based on the FAQ context, with a strict safety guard."
+    ),
+)
+
+llm_provider = st.sidebar.selectbox(
+    "LLM provider",
+    options=["openai", "ollama"],
+    index=1,  # default to Ollama
+)
+
+openai_model = st.sidebar.text_input(
+    "OpenAI model",
+    value="gpt-4o-mini",
+    help="Used only if provider = openai.",
+)
+
+ollama_model = st.sidebar.text_input(
+    "Ollama model",
+    value="llama3.2",
+    help="Used only if provider = ollama.",
+)
+
+show_sources = st.sidebar.checkbox(
+    "Show FAQ sources for each answer",
+    value=True,
+    help="Display the FAQ questions/sections that were used for the answer.",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "**Reminder:** hormonAI does not replace your oncology team and cannot give "
+    "individual treatment recommendations."
+)
+
+# ---------- RETRIEVER CACHING ----------
+@st.cache_resource
+def load_retriever(lang: str) -> FAQRetriever:
+    index_path = f"faq_index_{lang}.faiss"
+    qa_path = f"faq_qa_{lang}.pkl"
+    if not os.path.exists(index_path) or not os.path.exists(qa_path):
+        raise FileNotFoundError(
+            f"Missing index or QA file for language '{lang}'.\n"
+            f"Expected: {index_path} and {qa_path}"
+        )
+    return FAQRetriever(index_path=index_path, qa_path=qa_path, model_name=EMBEDDING_MODEL_NAME)
+
+
+try:
+    retriever = load_retriever(language)
+except Exception as e:
+    st.error(f"Error loading FAQ data: {e}")
+    st.stop()
+
+# ---------- SESSION STATE ----------
+# Each history item: {"role": "user"|"bot", "content": str, "sources": Optional[list]}
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "last_language" not in st.session_state:
+    st.session_state.last_language = language
+
+# Clear history when language changes so we don't mix EN/FR
+if language != st.session_state.last_language:
+    st.session_state.history = []
+    st.session_state.last_language = language
+
+# ---------- CHAT DISPLAY ----------
+st.markdown('<div class="chat-title">Chat with hormonAI</div>', unsafe_allow_html=True)
+
+chat_container = st.container()
+
+with chat_container:
+    for msg in st.session_state.history:
+        safe_text = html.escape(msg["content"]).replace("\n", "<br>")
+        if msg["role"] == "user":
+            user_html = f"""
+            <div class="chat-bubble-user">
+                <div class="chat-role">You</div>
+                <div class="chat-content">{safe_text}</div>
+            </div>
+            """
+            st.markdown(user_html, unsafe_allow_html=True)
+        else:
+            bot_html = f"""
+            <div class="chat-bubble-bot">
+                <div class="chat-role">hormonAI</div>
+                <div class="chat-content">{safe_text}</div>
+            </div>
+            """
+            st.markdown(bot_html, unsafe_allow_html=True)
+
+            # Optional debug / FAQ sources panel
+            if show_sources and msg.get("sources"):
+                with st.expander("FAQ sources used for this answer"):
+                    for i, src in enumerate(msg["sources"], start=1):
+                        st.markdown(f"**Source {i}** – relevance: `{src['score']:.3f}`")
+                        st.markdown(f"- **Section:** {src['section']}")
+                        st.markdown(f"- **Question:** {src['question']}")
+                        snippet = src["answer"]
+                        if len(snippet) > 350:
+                            snippet = snippet[:350] + "…"
+                        st.markdown(f"- **Answer snippet:** {snippet}")
+
+# ---------- HANDLE SEND (callback) ----------
+def handle_send(
+    retriever_obj: FAQRetriever = retriever,
+    use_llm_flag: bool = use_llm,
+    provider: str = llm_provider,
+    openai_m: str = openai_model,
+    ollama_m: str = ollama_model,
+):
+    user_input = st.session_state.get("user_input", "").strip()
+    if not user_input:
+        return
+
+    # Add user message to history
+    st.session_state.history.append(
+        {"role": "user", "content": user_input, "sources": None}
+    )
+
+    # Retrieve debug results for source display
+    try:
+        debug_results = retriever_obj.retrieve(user_input, top_k=3)
+    except Exception:
+        debug_results = []
+
+    # Call the core chatbot logic
+    try:
+        answer = chat_once(
+            retriever_obj,
+            user_query=user_input,
+            use_llm=use_llm_flag,
+            debug=False,
+            llm_provider=provider,
+            openai_model=openai_m,
+            ollama_model=ollama_m,
+        )
+    except Exception as e:
+        answer = (
+            "I ran into a technical error while trying to answer.\n\n"
+            f"Details: `{e}`"
+        )
+
+    # Prepare a lightweight summary of sources for display
+    sources_summary = []
+    for r in debug_results:
+        sources_summary.append(
+            {
+                "index": r["index"],
+                "score": r["score"],
+                "section": r["section"],
+                "question": r["question"],
+                "answer": r["answer"],
+            }
+        )
+
+    st.session_state.history.append(
+        {"role": "bot", "content": answer, "sources": sources_summary}
+    )
+
+    # Clear the input box after sending
+    st.session_state.user_input = ""
+
+# ---------- USER INPUT ----------
+if language == "fr":
+    placeholder = "Par exemple : « Quels effets secondaires sont fréquents avec le tamoxifène ? »"
+    label_text = "Posez votre question sur l’hormonothérapie adjuvante…"
+else:
+    placeholder = 'For example: "What side effects can I expect on tamoxifen?"'
+    label_text = "Ask your question about adjuvant hormone therapy…"
+
+st.markdown(
+    f'<div class="prompt-label">{label_text}</div>',
+    unsafe_allow_html=True,
+)
+
+user_input = st.text_area(
+    "",
+    key="user_input",
+    height=160,
+    placeholder=placeholder,
+)
+
+col1, col2 = st.columns([1, 4])
+with col1:
+    st.button("Send", on_click=handle_send)
