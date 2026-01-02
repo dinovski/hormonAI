@@ -8,6 +8,12 @@ It is designed to:
 - Offer both a **CLI chatbot** and a **Streamlit GUI**
 - Prioritize **safety, transparency, and source citation**
 
+## Features
+- Language switch: fully updates UI + retrieval
+- LLM toggle: FAQ text only vs empathetic rephrasing
+- Source transparency: every answer cites its FAQ origin
+- Safety guardrails: out-of-scope questions are declined
+
 ---
 
 ## Repository structure
@@ -37,8 +43,9 @@ pip install -r requirements.txt
 ## Ingest the FAQ (DOCX to RAG indexes)
 Parses the FAQ document by section and Q/A. 
 Builds a hybrid retriever:  
-FAISS on questions + FAISS on Q+A. 
-BM25 lexical search
+- FAISS on questions
+- FAISS on Q+A
+- BM25 lexical search
 ```python
 python ingest_faq.py -l en -d 20250613_FAQ_Hormono_EN.docx
 python ingest_faq.py -l fr -d 20250613_FAQ_Hormono_FR.docx
@@ -71,13 +78,3 @@ python chatbot.py -l en --use-llm --llm-provider ollama --ollama-model llama3.2
 streamlit run hormonai_app.py
 ```
 
-## GUI features
-```text
-Language switch: fully updates UI + retrieval
-
-LLM toggle: FAQ text only vs empathetic rephrasing
-
-Source transparency: every answer cites its FAQ origin
-
-Safety guardrails: out-of-scope questions are declined
-```
