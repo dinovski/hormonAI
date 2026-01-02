@@ -1,8 +1,9 @@
-![hormonAI](hormonAI.png)
+![hormonAI](hormonAI.png =718x310)
 
 *A compassionate, FAQ-restricted RAG chatbot for adjuvant hormone therapy*
 
 hormonAI is a **proof-of-concept Retrieval-Augmented Generation (RAG) chatbot** built on a curated medical FAQ about **adjuvant hormone therapy for breast cancer**.  
+
 It is designed to:
 - Answer **only** from the provided FAQ
 - Be **language-aware** (English / French)
@@ -18,7 +19,6 @@ It is designed to:
 ---
 
 ## Repository structure
-
 ```text
 .
 ├── ingest_faq.py          # Ingest DOCX FAQ; build hybrid retrieval indexes
@@ -30,6 +30,12 @@ It is designed to:
 ├── faq_fr_*.faiss         # Generated FAISS indexes (French)
 ├── faq_fr_*.pkl           # Generated metadata / BM25 (French)
 ├── hormonAI.png           # Logo (used by the GUI)
+├── tests/                 # Test scripts
+│   ├── inspect_qa.py
+│   └── test_retreival.py
+├── docs/                  # FAQ documents
+│   ├── 20250613_FAQ_Hormono_EN.docx
+│   └── 20250613_FAQ_Hormono_FR.docx
 └── README.md
 ```
 
@@ -48,8 +54,8 @@ Builds a hybrid retriever:
 - FAISS on Q+A
 - BM25 lexical search
 ```python
-python ingest_faq.py -l en -d 20250613_FAQ_Hormono_EN.docx
-python ingest_faq.py -l fr -d 20250613_FAQ_Hormono_FR.docx
+python ingest_faq.py -l en -d docs/20250613_FAQ_Hormono_EN.docx
+python ingest_faq.py -l fr -d docs/20250613_FAQ_Hormono_FR.docx
 ```
 ```text
 faq_<lang>_index_q.faiss    # FAISS index on questions
