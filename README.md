@@ -2,7 +2,7 @@
 
 *A compassionate, FAQ-restricted RAG chatbot for adjuvant hormone therapy*
 
-hormonAI is a **proof-of-concept Retrieval-Augmented Generation (RAG) chatbot** built on a curated medical FAQ about **adjuvant hormone therapy for breast cancer**.  
+hormonAI is a **Retrieval-Augmented Generation (RAG) chatbot** built on a curated medical FAQ about **adjuvant hormone therapy for breast cancer**.  
 
 It is designed to:
 - Answer **only** from the provided FAQ
@@ -25,11 +25,10 @@ It is designed to:
 ├── rag_core.py            # Core RAG logic (retriever, gating, LLM wrappers)
 ├── chatbot.py             # Command-line chatbot
 ├── hormonai_app.py        # Streamlit GUI
-├── faq_en_*.faiss         # Generated FAISS indexes (English)
-├── faq_en_*.pkl           # Generated metadata / BM25 (English)
-├── faq_fr_*.faiss         # Generated FAISS indexes (French)
-├── faq_fr_*.pkl           # Generated metadata / BM25 (French)
 ├── hormonAI.png           # Logo (used by the GUI)
+├── data/                  # Generated data
+│   ├── faq_{lang}_*.faiss # FAISS Q and Q/A indexes
+│   └── faq_{lang}_*.pkl   # Metadata / BM25
 ├── tests/                 # Test scripts
 │   ├── inspect_qa.py
 │   └── test_retreival.py
@@ -60,8 +59,8 @@ python ingest_faq.py -l fr -d docs/20250613_FAQ_Hormono_FR.docx
 ```text
 faq_<lang>_index_q.faiss    # FAISS index on questions
 faq_<lang>_index_qa.faiss   # FAISS index on question+answer
-faq_<lang>_bm25.pkl         # BM25 index
 faq_<lang>_qa.pkl           # Parsed FAQ items + metadata
+faq_<lang>_bm25.pkl         # BM25 index
 ```
 
 ## Run the chatbot (CLI)
@@ -71,7 +70,7 @@ python chatbot.py -l en
 
 ## Run the chatbot with re-ranking
 ```python
-python chatbot.py -l en --rerank
+python chatbot.py -l en --rerank (--debug)
 ```
 
 ## Run the chatbot with an LLM for rephrasing
