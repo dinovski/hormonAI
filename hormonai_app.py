@@ -342,10 +342,10 @@ with st.expander(t["about_title"], expanded=True):
 def load_retriever(lang: str, rerank: bool = False) -> HybridFAQRetriever:
     prefix = f"faq_{lang}"
     required = [
-        f"{prefix}_index_q.faiss",
-        f"{prefix}_index_qa.faiss",
-        f"{prefix}_qa.pkl",
-        f"{prefix}_bm25.pkl",
+        f"data/{prefix}_index_q.faiss",
+        f"data/{prefix}_index_qa.faiss",
+        f"data/{prefix}_qa.pkl",
+        f"data/{prefix}_bm25.pkl",
     ]
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
