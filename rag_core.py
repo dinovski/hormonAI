@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-rag_core.py
-
-Core logic for hormonAI:
-- hybrid retrieval (FAISS Q + FAISS QA + BM25 + optional rerank)
-- answerability gating (corpus keyword presence + non-empty core keywords)
-- response builder (NO LLM) OR optional LLM "rephrase only" (NEVER for abstains)
-
-Change requested:
-- DO NOT show "(Detected keywords: ...)" or any detected-word hints in abstain responses.
-"""
-
 from __future__ import annotations
 
 import os
@@ -18,30 +5,16 @@ import re
 import json
 import pickle
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
-
-# Optional deps (only needed when used)
-try:
-    import faiss  # type: ignore
-except Exception:
-    faiss = None  # type: ignore
-
-try:
-    from rank_bm25 import BM25Okapi  # type: ignore
-except Exception:
-    BM25Okapi = None  # type: ignore
-
-try:
-    from sentence_transformers import SentenceTransformer, CrossEncoder  # type: ignore
-except Exception:
-    SentenceTransformer = None  # type: ignore
-    CrossEncoder = None  # type: ignore
+import faiss
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 
 
 # ---------------------------
-# Language resources
+# Stopwords / keyword gating
 # ---------------------------
 
 EN_STOPWORDS = {
@@ -49,35 +22,33 @@ EN_STOPWORDS = {
     "to","of","in","on","for","with","as","at","by","from","into","about",
     "is","are","was","were","be","been","being",
     "do","does","did","doing",
+    "while","taking","take","taken","during","using",
     "can","could","should","would","will","may","might","must",
     "i","you","we","they","he","she","it","my","your","our","their",
     "this","that","these","those",
     "what","why","how","when","where","which",
-    "while","taking","take","taken","during","using",
 }
 
 FR_STOPWORDS = {
     "le","la","les","un","une","des","et","ou","mais","si","alors",
     "de","du","dans","sur","pour","avec","par","au","aux","en",
-    "est","sont","été","être","avoir","a","ont","ai","as","avons","avez",
+    "est","sont","été","etre","être","avoir","a","ont",
     "je","tu","il","elle","nous","vous","ils","elles",
     "ce","cet","cette","ces",
-    "quoi","pourquoi","comment","quand","où","quel","quelle","quels","quelles",
-    "pendant","durant","prendre","pris","prise","utiliser",
+    "quoi","pourquoi","comment","quand","où","ou","quel","quelle","quels","quelles",
 }
 
 GENERIC_EN = {
-    "safe","safety","careful","need","should","can","could","would",
-    "risk","danger","allowed","ok","okay","possible","recommend","recommended","advice",
-    "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
-    "side","effects","effect",
+    "safe","safety","careful","need","should","can","could","would","risk","danger",
+    "allowed","ok","okay","possible","recommend","recommended","advice",
+    "hormone","hormonal","therapy","treatment","medication","pill",
+    "medicine","drug","drugs",
 }
 
 GENERIC_FR = {
-    "sûr","sure","sécurité","prudent","prudence","besoin","dois","devrais","peux",
-    "risque","danger","autorisé","possible","recommandé","conseil",
-    "hormone","hormonale","traitement","thérapie","médicament","comprimé","pilule",
-    "effet","effets",
+    "sûr","sur","sure","sécurité","securite","prudent","prudence","besoin","dois","devrais","peux",
+    "risque","danger","autorisé","autorise","possible","recommandé","recommande","conseil",
+    "hormone","hormonale","traitement","thérapie","therapie","médicament","medicament","comprimé","comprime",
 }
 
 EN_KEEP = {
@@ -95,10 +66,24 @@ FR_KEEP = {
     "cholestérol","cholesterol",
 }
 
+# Drug/treatment words should NOT count as “anchors”
+DRUG_TREATMENT_EN = {
+    "tamoxifen","letrozole","anastrozole","exemestane",
+    "aromatase","inhibitor","inhibitors",
+    "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
+}
+
+DRUG_TREATMENT_FR = {
+    "tamoxifène","tamoxifene","létrozole","letrozole","anastrozole","exemestane",
+    "aromatase","inhibiteur","inhibiteurs",
+    "hormone","hormonale","hormonothérapie","hormonotherapie",
+    "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
+}
+
 
 def _norm_lang(lang: str) -> str:
     lang = (lang or "en").lower()
-    if lang in ("fr", "fra", "french"):
+    if lang in ("fr", "fra", "french", "français", "francais"):
         return "fr"
     return "en"
 
@@ -142,6 +127,28 @@ def extract_core_keywords(user_query: str, language: str) -> List[str]:
     return dedup
 
 
+def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
+    lang = _norm_lang(language)
+    drugset = DRUG_TREATMENT_FR if lang == "fr" else DRUG_TREATMENT_EN
+    anchors = [k for k in core_kws if k not in drugset]
+    seen = set()
+    out = []
+    for a in anchors:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def _contains_any_anchor(text: str, anchors: List[str]) -> bool:
+    hay = (text or "").lower()
+    return any(a.lower() in hay for a in anchors)
+
+
+# ---------------------------
+# Retrieval dataclasses
+# ---------------------------
+
 @dataclass
 class RetrievalCandidate:
     index: int
@@ -155,40 +162,166 @@ class RetrievalCandidate:
     rerank_score: Optional[float] = None
 
 
+@dataclass
+class AnswerResult:
+    answered: bool
+    answer_text: str
+    source_title: Optional[str] = None
+    source_section: Optional[str] = None
+    source_index: Optional[int] = None
+    debug: Optional[Dict[str, Any]] = None
+
+
 # ---------------------------
-# LLM wrappers (optional)
+# Hybrid Retriever
+# ---------------------------
+
+class HybridFAQRetriever:
+    def __init__(
+        self,
+        language: str = "en",
+        data_dir: str = "data",
+        top_k: int = 12,
+        embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        rerank: bool = False,
+        rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    ):
+        self.language = _norm_lang(language)
+        self.data_dir = data_dir
+        self.top_k = top_k
+        self.embedding_model_name = embedding_model
+
+        self.rerank = rerank
+        self.rerank_model = rerank_model
+
+        self._items: List[Dict[str, Any]] = []
+        self._bm25: Optional[BM25Okapi] = None
+        self._bm25_docs: List[List[str]] = []
+
+        self._index_q: Optional[faiss.Index] = None
+        self._index_qa: Optional[faiss.Index] = None
+
+        self._embedder: Optional[SentenceTransformer] = None
+
+        # tokens from questions+sections only
+        self._corpus_tokens: set[str] = set()
+
+        self._cross_encoder = None
+
+    def load(self) -> None:
+        prefix = f"faq_{self.language}"
+        qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
+        bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
+        idx_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
+        idx_qa_path = os.path.join(self.data_dir, f"{prefix}_index_qa.faiss")
+
+        with open(qa_path, "rb") as f:
+            payload = pickle.load(f)
+        self._items = payload["items"]
+
+        with open(bm25_path, "rb") as f:
+            payload = pickle.load(f)
+        self._bm25 = payload["bm25"]
+        self._bm25_docs = payload["bm25_docs"]
+
+        self._index_q = faiss.read_index(idx_q_path)
+        self._index_qa = faiss.read_index(idx_qa_path)
+
+        self._embedder = SentenceTransformer(self.embedding_model_name)
+
+        corpus_text = " ".join([f"{it.get('section','')} {it.get('question','')}" for it in self._items])
+        self._corpus_tokens = set(_tokenize(corpus_text))
+
+        if self.rerank:
+            try:
+                from sentence_transformers import CrossEncoder
+                self._cross_encoder = CrossEncoder(self.rerank_model)
+            except Exception:
+                self._cross_encoder = None
+
+    def _encode(self, text: str) -> np.ndarray:
+        assert self._embedder is not None
+        emb = self._embedder.encode([text], convert_to_numpy=True)
+        emb = emb.astype("float32")
+        faiss.normalize_L2(emb)
+        return emb
+
+    def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
+        if not self._items:
+            return []
+
+        assert self._bm25 is not None
+        assert self._index_q is not None
+        assert self._index_qa is not None
+
+        q_tokens = _tokenize(user_query)
+        bm25_scores = self._bm25.get_scores(q_tokens)
+        bm25_ranked = np.argsort(-bm25_scores)[: self.top_k]
+
+        q_emb = self._encode(f"Question: {user_query}")
+        _, Iq = self._index_q.search(q_emb, self.top_k)
+
+        qa_emb = self._encode(f"Question: {user_query}")
+        _, Iqa = self._index_qa.search(qa_emb, self.top_k)
+
+        def rrf(rank: int, k: int = 60) -> float:
+            return 1.0 / (k + rank)
+
+        fused: Dict[int, float] = {}
+
+        for r, idx in enumerate(bm25_ranked.tolist()):
+            fused[idx] = fused.get(idx, 0.0) + rrf(r)
+        for r, idx in enumerate(Iq[0].tolist()):
+            fused[idx] = fused.get(idx, 0.0) + rrf(r)
+        for r, idx in enumerate(Iqa[0].tolist()):
+            fused[idx] = fused.get(idx, 0.0) + rrf(r)
+
+        ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[: self.top_k]
+
+        candidates: List[RetrievalCandidate] = []
+        for idx, score in ranked:
+            it = self._items[int(idx)]
+            candidates.append(
+                RetrievalCandidate(
+                    index=int(idx),
+                    question=str(it.get("question", "")),
+                    section=str(it.get("section", "")),
+                    answer=str(it.get("answer", "")),
+                    fused_score=float(score),
+                )
+            )
+
+        if self._cross_encoder is not None and len(candidates) >= 2:
+            pairs = [(user_query, f"{c.section}\n{c.question}\n{c.answer}") for c in candidates]
+            try:
+                ce_scores = self._cross_encoder.predict(pairs)
+                for c, s in zip(candidates, ce_scores):
+                    c.rerank_score = float(s)
+                candidates.sort(key=lambda c: c.rerank_score if c.rerank_score is not None else -1e9, reverse=True)
+            except Exception:
+                pass
+
+        return candidates
+
+
+# ---------------------------
+# LLM (Ollama-only rephrase)
 # ---------------------------
 
 class LLMRephraser:
-    """
-    Only rephrases text that already comes from the FAQ.
-    It MUST NOT add new facts.
-    """
-
     def __init__(
         self,
-        provider: str,
         language: str,
-        openai_model: str = "gpt-4o-mini",
-        ollama_model: str = "llama3.2",
+        model: str = "llama3.2",
         temperature: float = 0.2,
         max_tokens: int = 450,
         timeout_s: int = 60,
     ):
-        self.provider = (provider or "").lower().strip()
         self.language = _norm_lang(language)
-        self.openai_model = openai_model
-        self.ollama_model = ollama_model
+        self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
-
-    def rephrase(self, user_query: str, faq_answer: str) -> str:
-        if self.provider == "openai":
-            return self._rephrase_openai(user_query, faq_answer)
-        if self.provider == "ollama":
-            return self._rephrase_ollama(user_query, faq_answer)
-        return faq_answer
 
     def _system_prompt(self) -> str:
         if self.language == "fr":
@@ -216,50 +349,26 @@ class LLMRephraser:
             "Answer (faithful rephrase, warm tone, no new facts):"
         )
 
-    def _rephrase_openai(self, user_query: str, faq_answer: str) -> str:
-        try:
-            from openai import OpenAI  # type: ignore
-        except Exception:
-            return faq_answer
-
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            return faq_answer
-
-        try:
-            client = OpenAI(api_key=api_key)
-            resp = client.chat.completions.create(
-                model=self.openai_model,
-                messages=[
-                    {"role": "system", "content": self._system_prompt()},
-                    {"role": "user", "content": self._user_prompt(user_query, faq_answer)},
-                ],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                timeout=self.timeout_s,
-            )
-            txt = (resp.choices[0].message.content or "").strip()
-            return txt or faq_answer
-        except Exception:
-            return faq_answer
-
-    def _rephrase_ollama(self, user_query: str, faq_answer: str) -> str:
+    def rephrase(self, user_query: str, faq_answer: str) -> str:
         import urllib.request
 
         base = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
         url = f"{base}/api/generate"
 
         payload = {
-            "model": self.ollama_model,
-            "prompt": self._system_prompt() + "\n\n" + self._user_prompt(user_query, faq_answer),
+            "model": self.model,
+            "prompt": self._user_prompt(user_query, faq_answer),
+            "system": self._system_prompt(),
             "stream": False,
             "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
         }
+
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
-                out = json.loads(r.read().decode("utf-8"))
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                out = json.loads(resp.read().decode("utf-8"))
             txt = (out.get("response") or "").strip()
             return txt or faq_answer
         except Exception:
@@ -267,178 +376,10 @@ class LLMRephraser:
 
 
 # ---------------------------
-# Retriever
+# Answer formatting + gating
 # ---------------------------
-
-class HybridFAQRetriever:
-    def __init__(
-        self,
-        language: str = "en",
-        data_dir: str = "data",
-        top_k: int = 12,
-        embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-        rerank: bool = False,
-        rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-    ):
-        self.language = _norm_lang(language)
-        self.data_dir = data_dir
-        self.top_k = top_k
-        self.embedding_model_name = embedding_model
-        self.rerank_enabled = rerank
-        self.rerank_model_name = rerank_model
-
-        self.qa_items: List[Dict[str, Any]] = []
-        self.bm25 = None
-        self.bm25_docs = None
-        self.index_q = None
-        self.index_qa = None
-
-        self._embedder = None
-        self._reranker = None
-        self._corpus_tokens: set[str] = set()
-
-    def load(self) -> None:
-        if faiss is None:
-            raise RuntimeError("faiss not installed. pip install faiss-cpu")
-        if SentenceTransformer is None:
-            raise RuntimeError("sentence-transformers not installed. pip install sentence-transformers")
-        if BM25Okapi is None:
-            raise RuntimeError("rank-bm25 not installed. pip install rank-bm25")
-
-        prefix = f"faq_{self.language}"
-        qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
-        bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
-        index_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
-        index_qa_path = os.path.join(self.data_dir, f"{prefix}_index_qa.faiss")
-
-        if not os.path.exists(qa_path):
-            raise FileNotFoundError(f"Missing {qa_path}. Run ingest_faq.py first.")
-        if not os.path.exists(bm25_path):
-            raise FileNotFoundError(f"Missing {bm25_path}. Run ingest_faq.py first.")
-        if not os.path.exists(index_q_path) or not os.path.exists(index_qa_path):
-            raise FileNotFoundError("Missing FAISS index files. Run ingest_faq.py first.")
-
-        with open(qa_path, "rb") as f:
-            blob = pickle.load(f)
-        self.qa_items = blob["items"]
-
-        with open(bm25_path, "rb") as f:
-            blob = pickle.load(f)
-        self.bm25 = blob["bm25"]
-        self.bm25_docs = blob["bm25_docs"]
-
-        self.index_q = faiss.read_index(index_q_path)
-        self.index_qa = faiss.read_index(index_qa_path)
-
-        self._embedder = SentenceTransformer(self.embedding_model_name)
-
-        if self.rerank_enabled:
-            if CrossEncoder is None:
-                raise RuntimeError("cross-encoder rerank requested but CrossEncoder unavailable.")
-            self._reranker = CrossEncoder(self.rerank_model_name)
-
-        toks = []
-        for it in self.qa_items:
-            toks.extend(_tokenize(it.get("question", "")))
-            toks.extend(_tokenize(it.get("section", "")))
-        self._corpus_tokens = set(toks)
-
-    def _embed(self, text: str) -> np.ndarray:
-        emb = self._embedder.encode([text], convert_to_numpy=True).astype("float32")
-        norm = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
-        return emb / norm
-
-    def _bm25_topk(self, query: str, k: int) -> List[Tuple[int, float]]:
-        q_toks = _tokenize(query)
-        scores = self.bm25.get_scores(q_toks)
-        idxs = np.argsort(scores)[::-1][:k]
-        return [(int(i), float(scores[i])) for i in idxs]
-
-    @staticmethod
-    def _rrf(rank: int, k: int = 60) -> float:
-        return 1.0 / (k + rank)
-
-    def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
-        if not user_query.strip():
-            return []
-
-        q_emb = self._embed(user_query)
-
-        Dq, Iq = self.index_q.search(q_emb, self.top_k)
-        faiss_q = [(int(idx), float(score)) for idx, score in zip(Iq[0], Dq[0]) if idx >= 0]
-
-        Dqa, Iqa = self.index_qa.search(q_emb, self.top_k)
-        faiss_qa = [(int(idx), float(score)) for idx, score in zip(Iqa[0], Dqa[0]) if idx >= 0]
-
-        bm25 = self._bm25_topk(user_query, self.top_k)
-
-        rank_q = {idx: r for r, (idx, _) in enumerate(faiss_q, start=1)}
-        rank_qa = {idx: r for r, (idx, _) in enumerate(faiss_qa, start=1)}
-        rank_b = {idx: r for r, (idx, _) in enumerate(bm25, start=1)}
-
-        all_ids = set(rank_q) | set(rank_qa) | set(rank_b)
-
-        candidates: List[RetrievalCandidate] = []
-        for idx in all_ids:
-            it = self.qa_items[idx]
-            fused = 0.0
-            if idx in rank_q:
-                fused += self._rrf(rank_q[idx])
-            if idx in rank_qa:
-                fused += self._rrf(rank_qa[idx])
-            if idx in rank_b:
-                fused += self._rrf(rank_b[idx])
-
-            candidates.append(
-                RetrievalCandidate(
-                    index=idx,
-                    question=it.get("question", ""),
-                    section=it.get("section", ""),
-                    answer=it.get("answer", ""),
-                    fused_score=fused,
-                    faiss_q_rank=rank_q.get(idx),
-                    faiss_qa_rank=rank_qa.get(idx),
-                    bm25_rank=rank_b.get(idx),
-                )
-            )
-
-        candidates.sort(key=lambda c: c.fused_score, reverse=True)
-
-        if self._reranker is not None and candidates:
-            topN = candidates[: min(18, len(candidates))]
-            pairs = [(user_query, c.question) for c in topN]
-            scores = self._reranker.predict(pairs)
-            for c, s in zip(topN, scores):
-                c.rerank_score = float(s)
-            candidates.sort(
-                key=lambda c: (
-                    c.rerank_score if c.rerank_score is not None else -1e9,
-                    c.fused_score
-                ),
-                reverse=True,
-            )
-
-        return candidates
-
-
-# ---------------------------
-# Answerability + response
-# ---------------------------
-
-@dataclass
-class AnswerResult:
-    answered: bool
-    answer_text: str
-    source_title: Optional[str] = None
-    source_section: Optional[str] = None
-    source_index: Optional[int] = None
-    debug: Optional[Dict[str, Any]] = None
-
 
 def build_abstain(language: str) -> str:
-    """
-    Abstain message WITHOUT showing detected keywords or any internal signals.
-    """
     lang = _norm_lang(language)
     if lang == "fr":
         return (
@@ -457,11 +398,11 @@ def build_abstain(language: str) -> str:
 def format_answer_no_llm(language: str, candidate: RetrievalCandidate) -> AnswerResult:
     lang = _norm_lang(language)
     if lang == "fr":
-        pre = "Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :\n\n"
-        src = f"— Source FAQ : “{candidate.question}” (section : {candidate.section})"
+        pre = "**Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
+        src = f"**— Source FAQ :** “{candidate.question}” (section : {candidate.section})"
     else:
-        pre = "Here is what the FAQ says about this topic (this does not replace advice from your care team):\n\n"
-        src = f"— FAQ source: “{candidate.question}” (section: {candidate.section})"
+        pre = "**Here is what the FAQ says about this topic (this does not replace advice from your care team):**\n\n"
+        src = f"**— FAQ source:** “{candidate.question}” (section: {candidate.section})"
 
     text = pre + candidate.answer.strip() + "\n\n" + src
     return AnswerResult(
@@ -473,33 +414,47 @@ def format_answer_no_llm(language: str, candidate: RetrievalCandidate) -> Answer
     )
 
 
+def _score_candidate(c: RetrievalCandidate) -> float:
+    return float(c.rerank_score) if c.rerank_score is not None else float(c.fused_score)
+
+
+def _find_best_grounded_candidate(candidates: List[RetrievalCandidate], anchors: List[str]) -> Optional[RetrievalCandidate]:
+    ranked = sorted(candidates, key=_score_candidate, reverse=True)
+
+    for c in ranked:
+        if _contains_any_anchor(c.question, anchors):
+            return c
+
+    for c in ranked:
+        if _contains_any_anchor(f"{c.question} {c.section}", anchors):
+            return c
+
+    for c in ranked:
+        if _contains_any_anchor(f"{c.question} {c.section} {c.answer}", anchors):
+            return c
+
+    return None
+
+
 def answer_query(
     retriever: HybridFAQRetriever,
     user_query: str,
     use_llm: bool = False,
-    llm_provider: str = "ollama",
-    openai_model: str = "gpt-4o-mini",
-    ollama_model: str = "llama3.2",
+    llm_model: str = "llama3.2",
     debug: bool = False,
 ) -> AnswerResult:
-    """
-    1) retrieve candidates
-    2) answerability gate:
-       - require >=1 core keyword
-       - require at least one core keyword appears in corpus (questions/sections)
-    3) if answerable, answer from best candidate; optionally rephrase with LLM
-       IMPORTANT: LLM only runs when answered=True
-    """
     lang = retriever.language
     candidates = retriever.retrieve(user_query)
 
     core_kws = extract_core_keywords(user_query, lang)
-    in_corpus = [k for k in core_kws if k in retriever._corpus_tokens]  # noqa: SLF001
+    anchors = anchor_keywords(core_kws, lang)
+    in_corpus_anchors = [k for k in anchors if k in retriever._corpus_tokens]  # noqa
 
     dbg: Dict[str, Any] = {}
     if debug:
         dbg["core_kws"] = core_kws
-        dbg["in_corpus"] = in_corpus
+        dbg["anchors"] = anchors
+        dbg["in_corpus_anchors"] = in_corpus_anchors
         dbg["top_candidates"] = [
             {
                 "idx": c.index,
@@ -510,34 +465,55 @@ def answer_query(
             for c in candidates[:10]
         ]
 
-    if len(core_kws) < 1:
+    if len(core_kws) < 1 or len(anchors) < 1 or len(in_corpus_anchors) < 1 or not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    if len(in_corpus) < 1:
+    best = _find_best_grounded_candidate(candidates, anchors)
+    if best is None:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    if not candidates:
+    # margin check (kept)
+    anchor_in_question = _contains_any_anchor(best.question, anchors)
+
+    ranked = sorted(candidates, key=_score_candidate, reverse=True)
+    best_score = _score_candidate(best)
+
+    second_grounded = None
+    for c in ranked:
+        if c.index == best.index:
+            continue
+        if _contains_any_anchor(f"{c.question} {c.section}", anchors) or _contains_any_anchor(
+            f"{c.question} {c.section} {c.answer}", anchors
+        ):
+            second_grounded = c
+            break
+
+    second_score = _score_candidate(second_grounded) if second_grounded else 0.0
+    margin = best_score - second_score
+    has_rerank = best.rerank_score is not None
+    min_margin = 0.08 if has_rerank else 0.002
+
+    if debug:
+        dbg["chosen_best"] = {"idx": best.index, "q": best.question, "score": best_score}
+        dbg["anchor_in_question"] = anchor_in_question
+        dbg["margin"] = margin
+        dbg["min_margin"] = min_margin
+
+    if (not anchor_in_question) and second_grounded is not None and margin < min_margin:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    best = candidates[0]
     base = format_answer_no_llm(lang, best)
 
     if use_llm:
-        rephraser = LLMRephraser(
-            provider=llm_provider,
-            language=lang,
-            openai_model=openai_model,
-            ollama_model=ollama_model,
-        )
-
+        rephraser = LLMRephraser(language=lang, model=llm_model)
         rephrased_answer = rephraser.rephrase(user_query=user_query, faq_answer=best.answer.strip())
 
         if lang == "fr":
-            pre = "Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :\n\n"
-            src = f"— Source FAQ : “{best.question}” (section : {best.section})"
+            pre = "**Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
+            src = f"**— Source FAQ :** “{best.question}” (section : {best.section})"
         else:
-            pre = "Here is what the FAQ says about this topic (this does not replace advice from your care team):\n\n"
-            src = f"— FAQ source: “{best.question}” (section: {best.section})"
+            pre = "**Here is what the FAQ says about this topic (this does not replace advice from your care team):**\n\n"
+            src = f"**— FAQ source:** “{best.question}” (section: {best.section})"
 
         base.answer_text = pre + rephrased_answer.strip() + "\n\n" + src
 
@@ -551,7 +527,12 @@ def print_debug(result: AnswerResult) -> None:
     if not result.debug:
         return
     print("\n[DEBUG] core_kws:", result.debug.get("core_kws"))
-    print("[DEBUG] in_corpus:", result.debug.get("in_corpus"))
+    print("[DEBUG] anchors:", result.debug.get("anchors"))
+    print("[DEBUG] in_corpus_anchors:", result.debug.get("in_corpus_anchors"))
     print("[DEBUG] Retrieved candidates:")
     for row in result.debug.get("top_candidates", []):
         print(f"  idx={row['idx']} fused={row['fused']} rerank={row['rerank']} | Q={row['q']}")
+    if "chosen_best" in result.debug:
+        print("[DEBUG] chosen_best:", result.debug.get("chosen_best"))
+        print("[DEBUG] anchor_in_question:", result.debug.get("anchor_in_question"))
+        print("[DEBUG] margin:", result.debug.get("margin"), "min_margin:", result.debug.get("min_margin"))

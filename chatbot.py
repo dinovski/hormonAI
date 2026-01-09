@@ -3,6 +3,7 @@
 chatbot.py
 
 CLI for hormonAI.
+
 Key rule:
 - LLM is ONLY used to rephrase an already-answered FAQ response.
 - Abstains NEVER go to the LLM.
@@ -26,10 +27,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rerank", action="store_true", help="Enable CrossEncoder reranking (better, slower).")
     p.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 
-    p.add_argument("--use-llm", action="store_true", help="Rephrase answers with LLM (ONLY for answered queries).")
-    p.add_argument("--llm-provider", choices=["openai", "ollama"], default="ollama")
-    p.add_argument("--openai-model", default="gpt-4o-mini")
-    p.add_argument("--ollama-model", default="llama3.2")
+    # Simplified LLM: Ollama-only
+    p.add_argument("--use-llm", action="store_true", help="Rephrase answers with an LLM (ONLY for answered queries).")
+    p.add_argument("--llm-model", default="llama3.2", help="Ollama model name (default: llama3.2).")
 
     p.add_argument("--debug", action="store_true")
     p.add_argument("--audit-log", default="logs/audit.jsonl")
@@ -77,9 +77,7 @@ def main() -> None:
             retriever=retriever,
             user_query=user,
             use_llm=args.use_llm,
-            llm_provider=args.llm_provider,
-            openai_model=args.openai_model,
-            ollama_model=args.ollama_model,
+            llm_model=args.llm_model,
             debug=args.debug,
         )
 

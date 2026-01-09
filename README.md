@@ -15,6 +15,7 @@ It is designed to:
 - LLM toggle: FAQ text only vs empathetic rephrasing
 - Source transparency: every answer cites its FAQ origin
 - Safety guardrails: out-of-scope questions are declined
+- Queries are logged for auditing and source material improvement
 
 ---
 
@@ -25,6 +26,7 @@ It is designed to:
 ├── rag_core.py            # Core RAG logic (retriever, gating, LLM wrappers)
 ├── chatbot.py             # Command-line chatbot
 ├── hormonai_app.py        # Streamlit GUI
+├── audit_logger.py        # Query logger
 ├── hormonAI.png           # Logo (used by the GUI)
 ├── data/                  # Generated data
 │   ├── faq_{lang}_*.faiss # FAISS Q and Q/A indexes
@@ -63,20 +65,19 @@ faq_<lang>_qa.pkl           # Parsed FAQ items + metadata
 faq_<lang>_bm25.pkl         # BM25 index
 ```
 
-## Run the chatbot (CLI)
+## Run hormonAI (CLI)
 ```python
-python chatbot.py -l en
+python chatbot.py -l en [--debug]
 ```
 
-## Run the chatbot with re-ranking
+## Run with re-ranking
 ```python
-python chatbot.py -l en --rerank (--debug)
+python chatbot.py -l en --rerank 
 ```
 
-## Run the chatbot with an LLM for rephrasing
+## Run with an LLM for rephrasing
 ```python
-ollama run llama3.2
-python chatbot.py -l en --use-llm --llm-provider ollama --ollama-model llama3.2
+python chatbot.py -l en --use-llm
 ```
 
 ## Run the app (GUI)

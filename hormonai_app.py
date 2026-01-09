@@ -1,5 +1,6 @@
 import os
 import html
+import re
 import streamlit as st
 
 from rag_core import (
@@ -14,6 +15,28 @@ st.set_page_config(
     layout="centered",
 )
 
+DEFAULT_LLM_MODEL = os.getenv("HORMONAI_LLM_MODEL", "llama3.2")
+
+
+# ---------- RENDER HELPERS ----------
+BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def render_bubble_text(text: str) -> str:
+    """
+    Render text inside our HTML chat bubbles while supporting **bold** markup.
+
+    We:
+    1) HTML-escape everything (safety)
+    2) Convert escaped **...** to <strong>...</strong>
+    3) Convert newlines to <br>
+    """
+    safe = html.escape(text or "")
+    safe = BOLD_RE.sub(r"<strong>\1</strong>", safe)
+    safe = safe.replace("\n", "<br>")
+    return safe
+
+
 # ---------- GLOBAL STYLES ----------
 st.markdown(
     """
@@ -25,13 +48,13 @@ st.markdown(
 
     /* Overall page styling */
     .stApp {
-        background-color: #ffffff;  /* white main area */
+        background-color: #ffffff;
         font-family: "Helvetica Neue", Arial, sans-serif;
     }
 
     /* Sidebar background */
     [data-testid="stSidebar"] {
-        background-color: #ffeef6;  /* warm light pink */
+        background-color: #ffeef6;
         border-right: 1px solid #f8d4e5;
     }
 
@@ -48,7 +71,7 @@ st.markdown(
         accent-color: #ff4da6;
     }
 
-    /* Checkbox/toggle labels in sidebar explicitly */
+    /* Sidebar labels */
     [data-testid="stSidebar"] label {
         color: #b26a7c !important;
     }
@@ -62,28 +85,69 @@ st.markdown(
         color: #b26a7c !important;
     }
 
-    /* Streamlit selectbox: BaseWeb select container (control area) */
+    /* Streamlit selectbox: closed state */
     [data-testid="stSidebar"] [data-baseweb="select"] > div {
-        background-color: #ffdde9 !important;  /* light pink, not black */
+        background-color: #ffdde9 !important;
         border-radius: 10px !important;
         border: 1px solid #ff9ccc !important;
     }
-
-    /* Streamlit selectbox: value/button text */
     [data-testid="stSidebar"] .stSelectbox div[role="button"] {
         background-color: transparent !important;
         color: #b26a7c !important;
     }
-
-    /* Any text inside selectbox in sidebar */
     [data-testid="stSidebar"] .stSelectbox * {
         color: #b26a7c !important;
     }
 
-    /* Dropdown list options when open (anywhere) */
+    /* ---------------------------------------------------------
+       FIX: dropdown menu open-state (language dropdown black)
+       --------------------------------------------------------- */
+
+    div[data-baseweb="popover"] {
+        background-color: transparent !important;
+    }
+
+    ul[data-baseweb="menu"] {
+        background-color: #fff9fd !important;
+        border: 1px solid #f3c4d9 !important;
+        border-radius: 12px !important;
+        padding: 6px !important;
+        box-shadow: 0 6px 18px rgba(179, 106, 124, 0.18) !important;
+    }
+
+    ul[data-baseweb="menu"] li {
+        background-color: #fff9fd !important;
+        color: #b26a7c !important;
+        border-radius: 10px !important;
+    }
+
+    ul[data-baseweb="menu"] li * {
+        color: #b26a7c !important;
+        background-color: transparent !important;
+    }
+
+    ul[data-baseweb="menu"] li:hover {
+        background-color: #ffeef6 !important;
+    }
+
+    ul[data-baseweb="menu"] li[aria-selected="true"] {
+        background-color: #ffe1ef !important;
+    }
+
+    div[role="listbox"] {
+        background-color: #fff9fd !important;
+        border-radius: 12px !important;
+        border: 1px solid #f3c4d9 !important;
+    }
     div[role="listbox"] * {
         color: #b26a7c !important;
-        background-color: #fff9fd !important;
+        background-color: transparent !important;
+    }
+    div[role="option"][aria-selected="true"] {
+        background-color: #ffe1ef !important;
+    }
+    div[role="option"]:hover {
+        background-color: #ffeef6 !important;
     }
 
     /* Center the header block */
@@ -112,27 +176,24 @@ st.markdown(
         padding: 0.55rem 1.4rem;
         font-weight: 600;
         cursor: pointer;
-        background-color: #d93f88 !important;          /* tasteful dark pink */
+        background-color: #d93f88 !important;
         background-image: none !important;
-        color: #ffffff !important;                     /* white text */
+        color: #ffffff !important;
         box-shadow: 0 3px 8px rgba(217, 63, 136, 0.35);
     }
-
-    /* Ensure inner span text stays white despite global * selector */
     .stButton > button * {
         color: #ffffff !important;
     }
-
     .stButton > button:hover {
         opacity: 0.96;
         box-shadow: 0 4px 10px rgba(217, 63, 136, 0.45);
     }
 
-    /* Chat message bubbles – rounded rectangles with text inside */
+    /* Chat message bubbles */
     .chat-bubble-user {
-        background-color: #ffe1ef;                 /* light pink */
+        background-color: #ffe1ef;
         padding: 0.85rem 1.1rem;
-        border-radius: 18px;                        /* fully rounded rectangle */
+        border-radius: 18px;
         margin: 0.3rem 0 0.6rem 0;
         max-width: 75%;
         margin-left: auto;
@@ -141,9 +202,9 @@ st.markdown(
         box-shadow: 0 2px 6px rgba(255, 154, 203, 0.25);
     }
     .chat-bubble-bot {
-        background-color: #e6faf7;                 /* light teal */
+        background-color: #e6faf7;
         padding: 0.85rem 1.1rem;
-        border-radius: 18px;                        /* fully rounded rectangle */
+        border-radius: 18px;
         margin: 0.3rem 0 0.6rem 0;
         max-width: 75%;
         margin-right: auto;
@@ -151,6 +212,7 @@ st.markdown(
         color: #8c6474 !important;
         box-shadow: 0 2px 6px rgba(120, 204, 190, 0.25);
     }
+
     .chat-role {
         font-size: 0.8rem;
         color: #bf7a8b !important;
@@ -158,13 +220,17 @@ st.markdown(
         text-transform: uppercase;
         letter-spacing: 0.04em;
     }
+
     .chat-content {
         font-size: 0.95rem;
         line-height: 1.45;
         color: inherit !important;
     }
+    .chat-content strong {
+        color: inherit !important;
+        font-weight: 750;
+    }
 
-    /* Chat title */
     .chat-title {
         font-size: 1.6rem;
         font-weight: 680;
@@ -178,21 +244,18 @@ st.markdown(
         border-radius: 14px !important;
         border: 1px solid #4c4f59 !important;
         box-shadow: 0 0 0 1px rgba(60, 63, 75, 0.4);
-        background-color: #2f3136 !important;  /* dark slate gray */
-        color: #f4f4f7 !important;             /* light text on dark bar */
+        background-color: #2f3136 !important;
+        color: #f4f4f7 !important;
     }
-
     textarea::placeholder {
-        color: #b9bac4 !important;  /* soft light gray */
+        color: #b9bac4 !important;
         opacity: 1;
     }
-
     textarea:focus-visible {
         outline: none !important;
         box-shadow: 0 0 0 2px rgba(255, 77, 166, 0.5) !important;
     }
 
-    /* Small pill tag for "prototype" */
     .pill {
         display: inline-block;
         padding: 0.15rem 0.7rem;
@@ -205,14 +268,12 @@ st.markdown(
         vertical-align: middle;
     }
 
-    /* About text readability */
     .about-text {
         color: #b26a7c !important;
         line-height: 1.6;
         font-size: 0.96rem;
     }
 
-    /* Prompt label */
     .prompt-label {
         font-size: 1.0rem;
         font-weight: 600;
@@ -220,25 +281,36 @@ st.markdown(
         margin-bottom: 0.25rem;
     }
 
-    /* Expander header */
     [data-testid="stExpander"] > details > summary {
-        background-color: #fff7fb !important;  /* soft very light pink/white */
+        background-color: #fff7fb !important;
         color: #b26a7c !important;
         border-radius: 10px !important;
         border: 1px solid #f3c4d9 !important;
     }
 
-    /* Chevron/arrow icon in expander */
+    [data-testid="stExpanderDetails"] {
+        background-color: transparent !important;
+    }
+
     [data-testid="stExpander"] svg path {
         fill: #b26a7c !important;
     }
 
-    /* Also cover button-based expander header (for older/newer variants) */
     [data-testid="stExpander"] button {
         background-color: #fff7fb !important;
         color: #b26a7c !important;
         border-radius: 10px !important;
         border: 1px solid #f3c4d9 !important;
+    }
+
+    .score-pill {
+        display: inline-block;
+        padding: 0.10rem 0.55rem;
+        border-radius: 999px;
+        background-color: #ffe1ef;
+        color: #d93f88 !important;
+        font-weight: 700;
+        border: 1px solid #ffb3d2;
     }
     </style>
     """,
@@ -288,8 +360,12 @@ Discutez toujours de votre situation et de toute décision thérapeutique direct
         "Si désactivé, hormonAI répond directement avec le texte de la FAQ.\n"
         "Si activé, le LLM reformule uniquement lorsque la réponse est trouvée dans la FAQ."
     )
-    llm_provider_label = "Fournisseur LLM"
     show_sources_label = "Afficher les sources de la FAQ pour chaque réponse"
+    use_rerank_label = "Activer le re-ranking (plus lent, parfois plus précis)"
+    use_rerank_help = (
+        "Utilise un modèle de re-ranking (CrossEncoder) pour réordonner les passages récupérés. "
+        "Cela peut améliorer la pertinence, mais c’est plus lent et demande des dépendances supplémentaires."
+    )
 else:
     subtitle_text = "A breast cancer support chatbot prototype"
     expander_label = "About hormonAI & safety"
@@ -325,8 +401,12 @@ Always discuss your situation and any treatment decisions directly with your onc
         "If disabled, hormonAI answers directly with the FAQ text.\n"
         "If enabled, the LLM only rephrases when an answer is found in the FAQ."
     )
-    llm_provider_label = "LLM provider"
     show_sources_label = "Show FAQ sources for each answer"
+    use_rerank_label = "Enable reranking (slower, sometimes more accurate)"
+    use_rerank_help = (
+        "Uses a CrossEncoder reranker to reorder retrieved FAQ entries. "
+        "This can improve relevance, but it’s slower and requires extra dependencies."
+    )
 
 # ---------- LOGO + TITLE ----------
 with st.container():
@@ -356,22 +436,10 @@ use_llm = st.sidebar.checkbox(
     help=use_llm_help,
 )
 
-llm_provider = st.sidebar.selectbox(
-    llm_provider_label,
-    options=["openai", "ollama"],
-    index=1,  # default to Ollama
-)
-
-openai_model = st.sidebar.text_input(
-    "OpenAI model",
-    value="gpt-4o-mini",
-    help="Used only if provider = openai.",
-)
-
-ollama_model = st.sidebar.text_input(
-    "Ollama model",
-    value="llama3.2",
-    help="Used only if provider = ollama.",
+use_rerank = st.sidebar.checkbox(
+    use_rerank_label,
+    value=False,
+    help=use_rerank_help,
 )
 
 show_sources = st.sidebar.checkbox(
@@ -385,39 +453,31 @@ st.sidebar.caption(sidebar_reminder)
 
 # ---------- RETRIEVER CACHING ----------
 @st.cache_resource
-def load_retriever(lang: str) -> HybridFAQRetriever:
-    """
-    Loads the hybrid retriever artifacts produced by ingest_faq.py:
-      faq_<lang>_index_q.faiss
-      faq_<lang>_index_qa.faiss
-      faq_<lang>_qa.pkl
-      faq_<lang>_bm25.pkl
-    """
-    r = HybridFAQRetriever(language=lang)
-    # if your HybridFAQRetriever requires explicit loading:
-    if hasattr(r, "load") and callable(getattr(r, "load")):
-        r.load()
+def load_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
+    r = HybridFAQRetriever(language=lang, rerank=rerank)
+    r.load()
     return r
 
-
 try:
-    retriever = load_retriever(language)
+    retriever = load_retriever(language, use_rerank)
 except Exception as e:
     st.error(f"Error loading FAQ data for language '{language}': {e}")
     st.stop()
 
 # ---------- SESSION STATE ----------
-# Each history item: {"role": "user"|"bot", "content": str, "sources": Optional[list]}
 if "history" not in st.session_state:
     st.session_state.history = []
 
 if "last_language" not in st.session_state:
     st.session_state.last_language = language
 
-# Clear history when language changes so we don't mix EN/FR content
-if language != st.session_state.last_language:
+if "last_rerank" not in st.session_state:
+    st.session_state.last_rerank = use_rerank
+
+if language != st.session_state.last_language or use_rerank != st.session_state.last_rerank:
     st.session_state.history = []
     st.session_state.last_language = language
+    st.session_state.last_rerank = use_rerank
 
 # ---------- CHAT DISPLAY ----------
 st.markdown(f'<div class="chat-title">{chat_title_label}</div>', unsafe_allow_html=True)
@@ -426,8 +486,8 @@ chat_container = st.container()
 
 with chat_container:
     for msg in st.session_state.history:
-        safe_text = html.escape(msg["content"]).replace("\n", "<br>")
         if msg["role"] == "user":
+            safe_text = render_bubble_text(msg["content"])
             user_html = f"""
             <div class="chat-bubble-user">
                 <div class="chat-role">{'Vous' if language == 'fr' else 'You'}</div>
@@ -435,17 +495,18 @@ with chat_container:
             </div>
             """
             st.markdown(user_html, unsafe_allow_html=True)
+
         else:
-            bot_label = "hormonAI"
+            safe_text = render_bubble_text(msg["content"])
             bot_html = f"""
             <div class="chat-bubble-bot">
-                <div class="chat-role">{bot_label}</div>
+                <div class="chat-role">hormonAI</div>
                 <div class="chat-content">{safe_text}</div>
             </div>
             """
             st.markdown(bot_html, unsafe_allow_html=True)
 
-            # Optional sources panel
+            # ✅ Only show dropdown when we actually answered AND sources exist
             if show_sources and msg.get("sources"):
                 exp_label = (
                     "Sources de la FAQ utilisées pour cette réponse"
@@ -454,7 +515,10 @@ with chat_container:
                 )
                 with st.expander(exp_label):
                     for i, src in enumerate(msg["sources"], start=1):
-                        st.markdown(f"**Source {i}** – relevance: `{src['score']:.3f}`")
+                        st.markdown(
+                            f"**Source {i}** – score: <span class='score-pill'>{src['score']:.3f}</span>",
+                            unsafe_allow_html=True,
+                        )
                         st.markdown(f"- **Section:** {src['section']}")
                         st.markdown(f"- **Question:** {src['question']}")
                         snippet = src["answer"]
@@ -462,11 +526,8 @@ with chat_container:
                             snippet = snippet[:350] + "…"
                         st.markdown(f"- **Answer snippet:** {snippet}")
 
-# ---------- HANDLE SEND (callback) ----------
+# ---------- HANDLE SEND ----------
 def _coerce_answer_result(res: object) -> tuple[bool, str]:
-    """
-    Supports both dict and dataclass-like returns from rag_core.answer_query.
-    """
     if isinstance(res, dict):
         answered = bool(res.get("answered", False))
         answer_text = str(res.get("answer_text", "")).strip()
@@ -481,10 +542,9 @@ def handle_send():
     if not user_input_val:
         return
 
-    # Add user message to history
     st.session_state.history.append({"role": "user", "content": user_input_val, "sources": None})
 
-    # Retrieve candidates for sources display (top 3)
+    # Compute sources summary (top 3) — only attach if answered=True
     sources_summary = []
     try:
         cands = retriever.retrieve(user_input_val) or []
@@ -504,15 +564,12 @@ def handle_send():
     except Exception:
         sources_summary = []
 
-    # Core answer (LLM only rephrases if answered=True inside rag_core)
     try:
         res = answer_query(
             retriever=retriever,
             user_query=user_input_val,
             use_llm=use_llm,
-            llm_provider=llm_provider,
-            openai_model=openai_model,
-            ollama_model=ollama_model,
+            llm_model=DEFAULT_LLM_MODEL,
             debug=False,
         )
         answered, answer_text = _coerce_answer_result(res)
@@ -528,7 +585,6 @@ def handle_send():
                 f"Details: `{e}`"
             )
 
-    # Only attach sources if we actually answered (prevents misleading “sources” on abstain)
     st.session_state.history.append(
         {
             "role": "bot",
@@ -537,7 +593,6 @@ def handle_send():
         }
     )
 
-    # Clear the input box after sending (safe inside callback)
     st.session_state.user_input = ""
 
 
