@@ -1,20 +1,49 @@
-# rag_core.py
+#!/usr/bin/env python3
+"""
+rag_core.py
+
+Core logic for hormonAI:
+- hybrid retrieval (FAISS Q + FAISS QA + BM25 + optional rerank)
+- answerability gating (corpus keyword presence + non-empty core keywords)
+- response builder (NO LLM) OR optional LLM "rephrase only" (NEVER for abstains)
+
+Change requested:
+- DO NOT show "(Detected keywords: ...)" or any detected-word hints in abstain responses.
+"""
+
+from __future__ import annotations
+
 import os
 import re
+import json
 import pickle
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import requests
 
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# Optional deps (only needed when used)
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None  # type: ignore
+
+try:
+    from rank_bm25 import BM25Okapi  # type: ignore
+except Exception:
+    BM25Okapi = None  # type: ignore
+
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder  # type: ignore
+except Exception:
+    SentenceTransformer = None  # type: ignore
+    CrossEncoder = None  # type: ignore
+
 
 # ---------------------------
-# Keywords / gating
+# Language resources
 # ---------------------------
+
 EN_STOPWORDS = {
     "a","an","the","and","or","but","if","then","than","so","because",
     "to","of","in","on","for","with","as","at","by","from","into","about",
@@ -24,321 +53,505 @@ EN_STOPWORDS = {
     "i","you","we","they","he","she","it","my","your","our","their",
     "this","that","these","those",
     "what","why","how","when","where","which",
+    "while","taking","take","taken","during","using",
 }
-EN_KEEP = {"pregnancy","recurrence","tamoxifen","aromatase","inhibitor","clot","thrombosis","fertility","child","pause", "sun", "uv", "mri"}
 
-FR_STOPWORDS = {"le","la","les","un","une","des","et","ou","mais","si","alors",
-                "de","du","dans","sur","pour","avec","par","au","aux","en",
-                "est","sont","été","être","avoir","a","ont",
-                "je","tu","il","elle","nous","vous","ils","elles",
-                "ce","cet","cette","ces",
-                "quoi","pourquoi","comment","quand","où","quel","quelle","quels","quelles"}
+FR_STOPWORDS = {
+    "le","la","les","un","une","des","et","ou","mais","si","alors",
+    "de","du","dans","sur","pour","avec","par","au","aux","en",
+    "est","sont","été","être","avoir","a","ont","ai","as","avons","avez",
+    "je","tu","il","elle","nous","vous","ils","elles",
+    "ce","cet","cette","ces",
+    "quoi","pourquoi","comment","quand","où","quel","quelle","quels","quelles",
+    "pendant","durant","prendre","pris","prise","utiliser",
+}
 
-def tokenize(text: str) -> List[str]:
-    return re.findall(r"\b\w+\b", (text or "").lower())
+GENERIC_EN = {
+    "safe","safety","careful","need","should","can","could","would",
+    "risk","danger","allowed","ok","okay","possible","recommend","recommended","advice",
+    "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
+    "side","effects","effect",
+}
 
-def extract_keywords(query: str, language: str) -> List[str]:
-    toks = tokenize(query)
-    if language == "en":
-        kws = []
-        for t in toks:
-            if t in EN_KEEP:
-                kws.append(t)
-            elif t not in EN_STOPWORDS and len(t) >= 3:
-                kws.append(t)
-        seen = set()
-        out = []
-        for k in kws:
-            if k not in seen:
-                out.append(k); seen.add(k)
-        return out[:12]
-    kws = [t for t in toks if t not in FR_STOPWORDS and len(t) >= 3]
-    seen = set()
-    out = []
-    for k in kws:
-        if k not in seen:
-            out.append(k); seen.add(k)
-    return out[:12]
+GENERIC_FR = {
+    "sûr","sure","sécurité","prudent","prudence","besoin","dois","devrais","peux",
+    "risque","danger","autorisé","possible","recommandé","conseil",
+    "hormone","hormonale","traitement","thérapie","médicament","comprimé","pilule",
+    "effet","effets",
+}
 
-def overlap_score(query_keywords: List[str], item: Dict[str, Any]) -> int:
-    blob = " ".join([item.get("question",""), item.get("answer","")]).lower()
-    return sum(1 for kw in query_keywords if kw.lower() in blob)
+EN_KEEP = {
+    "pregnancy","recurrence","tamoxifen","letrozole","anastrozole","exemestane",
+    "aromatase","inhibitor","clot","clots","thrombosis","embolism",
+    "fertility","child","pause","sun","uv","mri","mammogram",
+    "depression","hot","flushes","bone","osteoporosis","cholesterol",
+}
 
-def choose_best_candidate(
-    user_query: str,
-    language: str,
-    candidates: List[Dict[str, Any]],
-    debug: bool = False,
-) -> Optional[Dict[str, Any]]:
-    """
-    Select the best FAQ entry while preventing off-topic answers.
-
-    Strategy:
-    1) Compute keyword overlap from extracted keywords (guardrail).
-    2) If overlap is informative, require at least 1 overlap.
-    3) If overlap is NOT informative (keywords too few / too generic), do NOT let it override retrieval.
-       In that case, fall back to the top retrieval hit (rerank_score if available, else fused_score).
-    """
-    if not candidates:
-        return None
-
-    kws = extract_keywords(user_query, language)
-
-    # If keyword extraction produced nothing, we have no reliable gating signal.
-    # Fall back to best retrieval hit (still FAQ-restricted, but avoids random “need/careful” matches).
-    if not kws:
-        if debug:
-            print("[DEBUG] No extracted keywords → returning top candidate by retrieval ranking.")
-        return candidates[0]
-
-    # Heuristic: if keywords are too few, overlap gating becomes brittle and may prefer generic matches.
-    # Example: "need", "careful" will overlap with many unrelated questions.
-    # In this case, we treat overlap as weak evidence, not a strict requirement.
-    overlap_is_weak = (len(kws) <= 2)
-
-    scored = [(overlap_score(kws, c), c) for c in candidates]
-    max_ov = max(ov for ov, _ in scored) if scored else 0
-
-    if debug:
-        print("\n[DEBUG] keywords:", kws)
-        for ov, c in sorted(scored, key=lambda x: (-x[0], -x[1].get("fused_score", 0)))[:10]:
-            rr = c.get("rerank_score")
-            rr_s = f" rerank={rr:.3f}" if rr is not None else ""
-            print(f"  overlap={ov} idx={c['index']} fused={c.get('fused_score', 0):.5f}{rr_s} | Q={c['question'][:80]}")
-        print(f"[DEBUG] overlap_is_weak={overlap_is_weak} max_overlap={max_ov}")
-
-    # If overlap provides signal (max overlap >=1) and keywords are not weak, enforce overlap>=1.
-    if (not overlap_is_weak) and max_ov >= 1:
-        passed = [c for ov, c in scored if ov >= 1]
-        if not passed:
-            return None
-
-        # Prefer rerank_score if present (higher is better), else fused_score
-        if passed[0].get("rerank_score") is not None:
-            passed = sorted(passed, key=lambda c: (c["rerank_score"], c.get("fused_score", 0.0)), reverse=True)
-        else:
-            passed = sorted(passed, key=lambda c: c.get("fused_score", 0.0), reverse=True)
-        return passed[0]
-
-    # Otherwise, overlap is weak or uninformative:
-    # rely on retrieval ranking (reranker if enabled, else fused_score ordering).
-    # Since candidates are already ordered by the retriever, choose top-1.
-    return candidates[0]
+FR_KEEP = {
+    "grossesse","récidive","recidive","tamoxifène","tamoxifene","létrozole","letrozole",
+    "anastrozole","exemestane","aromatase","inhibiteur","thrombose","embolie",
+    "fertilité","fertilite","enfant","pause","soleil","uv","irm","mammographie",
+    "dépression","depression","bouffées","bouffees","os","ostéoporose","osteoporose",
+    "cholestérol","cholesterol",
+}
 
 
-# ---------------------------
-# LLM calls
-# ---------------------------
-def call_ollama_chat(model: str, messages: List[Dict[str, str]]) -> str:
-    resp = requests.post(
-        "http://localhost:11434/api/chat",
-        json={"model": model, "messages": messages, "stream": False},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
+def _norm_lang(lang: str) -> str:
+    lang = (lang or "en").lower()
+    if lang in ("fr", "fra", "french"):
+        return "fr"
+    return "en"
 
-def call_openai_chat(model: str, messages: List[Dict[str, str]]) -> str:
-    from openai import OpenAI
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-    client = OpenAI(api_key=api_key)
-    out = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=600,
-    )
-    return out.choices[0].message.content
 
-def system_prompt(language: str) -> str:
-    if language == "fr":
-        return (
-            "Vous êtes un assistant bienveillant.\n"
-            "RÈGLES:\n"
-            "- Utilisez UNIQUEMENT les informations du CONTEXTE.\n"
-            "- N'inventez pas d'informations médicales.\n"
-            "- Si la réponse n'est pas dans le CONTEXTE, dites-le.\n"
-            "- Pas de conseils médicaux personnalisés.\n"
-            "Ton: chaleureux, clair.\n"
-        )
-    return (
-        "You are a compassionate assistant.\n"
-        "RULES:\n"
-        "- Use ONLY the CONTEXT.\n"
-        "- Do NOT invent medical facts.\n"
-        "- If the answer isn't in the CONTEXT, say so.\n"
-        "- No personalized medical advice.\n"
-        "Tone: warm, clear.\n"
-    )
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"\b[\w\-']+\b", (text or "").lower())
 
-def format_faq_answer(top: Dict[str, Any], language: str) -> str:
-    section = top["section"]
-    q = top["question"]
-    a = top["answer"].strip()
-    if language == "fr":
-        return (
-            "Voici ce que la FAQ indique à ce sujet :\n\n"
-            f"{a}\n\n"
-            f"— Source FAQ : « {q} » (section : {section})\n\n"
-            "Pour toute décision médicale personnalisée, parlez-en avec votre équipe soignante."
-        )
-    return (
-        "Here is what the FAQ says about this topic (this does not replace advice from your care team):\n\n"
-        f"{a}\n\n"
-        f"— FAQ source: “{q}” (section: {section})\n\n"
-        "If you’re considering a personal medical decision, it’s best to discuss it with your oncology team."
-    )
 
-def answer_with_llm(
-    language: str,
-    provider: str,
-    openai_model: str,
-    ollama_model: str,
-    user_query: str,
-    top: Dict[str, Any],
-) -> str:
-    section = top["section"]
-    q = top["question"]
-    a = top["answer"].strip()
+def extract_core_keywords(user_query: str, language: str) -> List[str]:
+    lang = _norm_lang(language)
+    toks = _tokenize(user_query)
 
-    if language == "fr":
-        source_line = f"— Source FAQ : « {q} » (section : {section})"
-        user = (
-            f"Question utilisateur:\n{user_query}\n\n"
-            f"CONTEXTE (utiliser uniquement ceci):\n{a}\n\n"
-            "Consignes:\n"
-            "- Répondre avec empathie.\n"
-            "- Ne pas ajouter d'informations médicales.\n"
-            "- Reprendre fidèlement le contenu du contexte.\n"
-            "- Finir par la ligne de source EXACTE ci-dessous.\n\n"
-            f"Ligne de source:\n{source_line}\n"
-        )
+    if lang == "fr":
+        stop = FR_STOPWORDS
+        gen = GENERIC_FR
+        keep = FR_KEEP
     else:
-        source_line = f"— FAQ source: “{q}” (section: {section})"
-        user = (
-            f"User question:\n{user_query}\n\n"
-            f"CONTEXT (use only this):\n{a}\n\n"
-            "Instructions:\n"
-            "- Answer with empathy.\n"
-            "- Do not add medical facts.\n"
-            "- Stay faithful to the context.\n"
-            "- End with the EXACT source line below.\n\n"
-            f"Source line:\n{source_line}\n"
+        stop = EN_STOPWORDS
+        gen = GENERIC_EN
+        keep = EN_KEEP
+
+    out: List[str] = []
+    for t in toks:
+        if t in keep:
+            out.append(t)
+            continue
+        if t in stop:
+            continue
+        if t in gen:
+            continue
+        if len(t) <= 2:
+            continue
+        out.append(t)
+
+    seen = set()
+    dedup = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            dedup.append(t)
+    return dedup
+
+
+@dataclass
+class RetrievalCandidate:
+    index: int
+    question: str
+    section: str
+    answer: str
+    fused_score: float
+    bm25_rank: Optional[int] = None
+    faiss_q_rank: Optional[int] = None
+    faiss_qa_rank: Optional[int] = None
+    rerank_score: Optional[float] = None
+
+
+# ---------------------------
+# LLM wrappers (optional)
+# ---------------------------
+
+class LLMRephraser:
+    """
+    Only rephrases text that already comes from the FAQ.
+    It MUST NOT add new facts.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        language: str,
+        openai_model: str = "gpt-4o-mini",
+        ollama_model: str = "llama3.2",
+        temperature: float = 0.2,
+        max_tokens: int = 450,
+        timeout_s: int = 60,
+    ):
+        self.provider = (provider or "").lower().strip()
+        self.language = _norm_lang(language)
+        self.openai_model = openai_model
+        self.ollama_model = ollama_model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout_s = timeout_s
+
+    def rephrase(self, user_query: str, faq_answer: str) -> str:
+        if self.provider == "openai":
+            return self._rephrase_openai(user_query, faq_answer)
+        if self.provider == "ollama":
+            return self._rephrase_ollama(user_query, faq_answer)
+        return faq_answer
+
+    def _system_prompt(self) -> str:
+        if self.language == "fr":
+            return (
+                "Tu es un assistant empathique, STRICTEMENT limité au texte fourni. "
+                "Tu dois REFORMULER fidèlement le texte FAQ, sans ajouter, supprimer ou modifier des faits. "
+                "Aucune déduction clinique. Aucun avis personnalisé. Conserve les puces si présentes."
+            )
+        return (
+            "You are an empathetic assistant STRICTLY limited to provided text. "
+            "You must REPHRASE the provided FAQ text without adding, removing, or changing facts. "
+            "No clinical inferences. No personalized advice. Preserve bullet points if present."
         )
 
-    messages = [
-        {"role": "system", "content": system_prompt(language)},
-        {"role": "user", "content": user},
-    ]
-    if provider == "openai":
-        return call_openai_chat(openai_model, messages)
-    return call_ollama_chat(ollama_model, messages)
+    def _user_prompt(self, user_query: str, faq_answer: str) -> str:
+        if self.language == "fr":
+            return (
+                f"Question de l'utilisateur:\n{user_query}\n\n"
+                f"Texte FAQ (à reformuler fidèlement):\n{faq_answer}\n\n"
+                "Réponse (reformulation fidèle, chaleureuse, sans nouveaux faits):"
+            )
+        return (
+            f"User question:\n{user_query}\n\n"
+            f"FAQ text (rephrase faithfully):\n{faq_answer}\n\n"
+            "Answer (faithful rephrase, warm tone, no new facts):"
+        )
+
+    def _rephrase_openai(self, user_query: str, faq_answer: str) -> str:
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception:
+            return faq_answer
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return faq_answer
+
+        try:
+            client = OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=self.openai_model,
+                messages=[
+                    {"role": "system", "content": self._system_prompt()},
+                    {"role": "user", "content": self._user_prompt(user_query, faq_answer)},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout_s,
+            )
+            txt = (resp.choices[0].message.content or "").strip()
+            return txt or faq_answer
+        except Exception:
+            return faq_answer
+
+    def _rephrase_ollama(self, user_query: str, faq_answer: str) -> str:
+        import urllib.request
+
+        base = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        url = f"{base}/api/generate"
+
+        payload = {
+            "model": self.ollama_model,
+            "prompt": self._system_prompt() + "\n\n" + self._user_prompt(user_query, faq_answer),
+            "stream": False,
+            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
+                out = json.loads(r.read().decode("utf-8"))
+            txt = (out.get("response") or "").strip()
+            return txt or faq_answer
+        except Exception:
+            return faq_answer
 
 
 # ---------------------------
-# Hybrid Retriever
+# Retriever
 # ---------------------------
+
 class HybridFAQRetriever:
     def __init__(
         self,
-        prefix: str,
-        language: str,
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        enable_rerank: bool = False,
-        reranker_model: str = DEFAULT_RERANKER,
+        language: str = "en",
+        data_dir: str = "data",
+        top_k: int = 12,
+        embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        rerank: bool = False,
+        rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     ):
-        self.prefix = prefix
-        self.language = language
+        self.language = _norm_lang(language)
+        self.data_dir = data_dir
+        self.top_k = top_k
+        self.embedding_model_name = embedding_model
+        self.rerank_enabled = rerank
+        self.rerank_model_name = rerank_model
 
-        self.index_q = faiss.read_index(f"data/{prefix}_index_q.faiss")
-        self.index_qa = faiss.read_index(f"data/{prefix}_index_qa.faiss")
+        self.qa_items: List[Dict[str, Any]] = []
+        self.bm25 = None
+        self.bm25_docs = None
+        self.index_q = None
+        self.index_qa = None
 
-        with open(f"data/{prefix}_qa.pkl", "rb") as f:
-            qa = pickle.load(f)
-        self.items = qa["items"]
+        self._embedder = None
+        self._reranker = None
+        self._corpus_tokens: set[str] = set()
 
-        with open(f"data/{prefix}_bm25.pkl", "rb") as f:
-            bm = pickle.load(f)
-        self.bm25 = bm["bm25"]
+    def load(self) -> None:
+        if faiss is None:
+            raise RuntimeError("faiss not installed. pip install faiss-cpu")
+        if SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers not installed. pip install sentence-transformers")
+        if BM25Okapi is None:
+            raise RuntimeError("rank-bm25 not installed. pip install rank-bm25")
 
-        self.embedder = SentenceTransformer(embedding_model)
+        prefix = f"faq_{self.language}"
+        qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
+        bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
+        index_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
+        index_qa_path = os.path.join(self.data_dir, f"{prefix}_index_qa.faiss")
 
-        self.enable_rerank = enable_rerank
-        self.reranker = CrossEncoder(reranker_model) if enable_rerank else None
+        if not os.path.exists(qa_path):
+            raise FileNotFoundError(f"Missing {qa_path}. Run ingest_faq.py first.")
+        if not os.path.exists(bm25_path):
+            raise FileNotFoundError(f"Missing {bm25_path}. Run ingest_faq.py first.")
+        if not os.path.exists(index_q_path) or not os.path.exists(index_qa_path):
+            raise FileNotFoundError("Missing FAISS index files. Run ingest_faq.py first.")
+
+        with open(qa_path, "rb") as f:
+            blob = pickle.load(f)
+        self.qa_items = blob["items"]
+
+        with open(bm25_path, "rb") as f:
+            blob = pickle.load(f)
+        self.bm25 = blob["bm25"]
+        self.bm25_docs = blob["bm25_docs"]
+
+        self.index_q = faiss.read_index(index_q_path)
+        self.index_qa = faiss.read_index(index_qa_path)
+
+        self._embedder = SentenceTransformer(self.embedding_model_name)
+
+        if self.rerank_enabled:
+            if CrossEncoder is None:
+                raise RuntimeError("cross-encoder rerank requested but CrossEncoder unavailable.")
+            self._reranker = CrossEncoder(self.rerank_model_name)
+
+        toks = []
+        for it in self.qa_items:
+            toks.extend(_tokenize(it.get("question", "")))
+            toks.extend(_tokenize(it.get("section", "")))
+        self._corpus_tokens = set(toks)
 
     def _embed(self, text: str) -> np.ndarray:
-        return self.embedder.encode([text], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        emb = self._embedder.encode([text], convert_to_numpy=True).astype("float32")
+        norm = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+        return emb / norm
 
-    def _search_faiss(self, index: faiss.Index, query: str, k: int) -> List[int]:
-        qv = self._embed(query)
-        _, inds = index.search(qv, k)
-        return [int(i) for i in inds[0] if int(i) != -1]
-
-    def _search_bm25(self, query: str, k: int) -> List[int]:
-        toks = tokenize(query)
-        scores = self.bm25.get_scores(toks)
-        top = np.argsort(scores)[::-1][:k]
-        return [int(i) for i in top]
+    def _bm25_topk(self, query: str, k: int) -> List[Tuple[int, float]]:
+        q_toks = _tokenize(query)
+        scores = self.bm25.get_scores(q_toks)
+        idxs = np.argsort(scores)[::-1][:k]
+        return [(int(i), float(scores[i])) for i in idxs]
 
     @staticmethod
-    def rrf_fuse(lists: List[List[int]], k: int = 60) -> Dict[int, float]:
-        fused: Dict[int, float] = {}
-        for lst in lists:
-            for rank, doc_id in enumerate(lst):
-                fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-        return fused
+    def _rrf(rank: int, k: int = 60) -> float:
+        return 1.0 / (k + rank)
 
-    def retrieve(self, query: str, top_k: int = 10, recall_k: int = 60, debug: bool = False) -> List[Dict[str, Any]]:
-        q_ids = self._search_faiss(self.index_q, query, recall_k)
-        qa_ids = self._search_faiss(self.index_qa, query, recall_k)
-        bm_ids = self._search_bm25(query, recall_k)
+    def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
+        if not user_query.strip():
+            return []
 
-        fused = self.rrf_fuse([q_ids, qa_ids, bm_ids], k=60)
-        candidates = sorted(fused.keys(), key=lambda i: fused[i], reverse=True)[: max(100, recall_k)]
+        q_emb = self._embed(user_query)
 
-        rerank_scores = None
-        if self.enable_rerank and candidates:
-            cand = candidates[: min(40, len(candidates))]
-            pairs = []
-            for i in cand:
-                it = self.items[i]
-                text = f"{it['section']}\nQ: {it['question']}\nA: {it['answer']}"
-                pairs.append((query, text))
-            scores = self.reranker.predict(pairs)
-            rerank_scores = {cand[i]: float(scores[i]) for i in range(len(cand))}
-            candidates = sorted(cand, key=lambda i: rerank_scores[i], reverse=True)
+        Dq, Iq = self.index_q.search(q_emb, self.top_k)
+        faiss_q = [(int(idx), float(score)) for idx, score in zip(Iq[0], Dq[0]) if idx >= 0]
 
-        out = []
-        for idx in candidates[:top_k]:
-            it = self.items[idx]
-            out.append(
-                {
-                    "index": idx,
-                    "fused_score": float(fused.get(idx, 0.0)),
-                    "rerank_score": float(rerank_scores[idx]) if rerank_scores else None,
-                    "section": it["section"],
-                    "question": it["question"],
-                    "answer": it["answer"],
-                }
+        Dqa, Iqa = self.index_qa.search(q_emb, self.top_k)
+        faiss_qa = [(int(idx), float(score)) for idx, score in zip(Iqa[0], Dqa[0]) if idx >= 0]
+
+        bm25 = self._bm25_topk(user_query, self.top_k)
+
+        rank_q = {idx: r for r, (idx, _) in enumerate(faiss_q, start=1)}
+        rank_qa = {idx: r for r, (idx, _) in enumerate(faiss_qa, start=1)}
+        rank_b = {idx: r for r, (idx, _) in enumerate(bm25, start=1)}
+
+        all_ids = set(rank_q) | set(rank_qa) | set(rank_b)
+
+        candidates: List[RetrievalCandidate] = []
+        for idx in all_ids:
+            it = self.qa_items[idx]
+            fused = 0.0
+            if idx in rank_q:
+                fused += self._rrf(rank_q[idx])
+            if idx in rank_qa:
+                fused += self._rrf(rank_qa[idx])
+            if idx in rank_b:
+                fused += self._rrf(rank_b[idx])
+
+            candidates.append(
+                RetrievalCandidate(
+                    index=idx,
+                    question=it.get("question", ""),
+                    section=it.get("section", ""),
+                    answer=it.get("answer", ""),
+                    fused_score=fused,
+                    faiss_q_rank=rank_q.get(idx),
+                    faiss_qa_rank=rank_qa.get(idx),
+                    bm25_rank=rank_b.get(idx),
+                )
             )
 
-        if debug:
-            print("\n[DEBUG] Retrieved candidates:")
-            for r in out[:10]:
-                print(
-                    f"  idx={r['index']} fused={r['fused_score']:.5f}"
-                    + (f" rerank={r['rerank_score']:.3f}" if r["rerank_score"] is not None else "")
-                    + f" | Q={r['question'][:90]}"
-                )
-        return out
+        candidates.sort(key=lambda c: c.fused_score, reverse=True)
 
-    def grep(self, keyword: str) -> List[Dict[str, Any]]:
-        kw = (keyword or "").lower()
-        hits = []
-        for i, it in enumerate(self.items):
-            blob = (it["question"] + "\n" + it["answer"]).lower()
-            if kw in blob:
-                hits.append({"index": i, **it})
-        return hits
+        if self._reranker is not None and candidates:
+            topN = candidates[: min(18, len(candidates))]
+            pairs = [(user_query, c.question) for c in topN]
+            scores = self._reranker.predict(pairs)
+            for c, s in zip(topN, scores):
+                c.rerank_score = float(s)
+            candidates.sort(
+                key=lambda c: (
+                    c.rerank_score if c.rerank_score is not None else -1e9,
+                    c.fused_score
+                ),
+                reverse=True,
+            )
+
+        return candidates
+
+
+# ---------------------------
+# Answerability + response
+# ---------------------------
+
+@dataclass
+class AnswerResult:
+    answered: bool
+    answer_text: str
+    source_title: Optional[str] = None
+    source_section: Optional[str] = None
+    source_index: Optional[int] = None
+    debug: Optional[Dict[str, Any]] = None
+
+
+def build_abstain(language: str) -> str:
+    """
+    Abstain message WITHOUT showing detected keywords or any internal signals.
+    """
+    lang = _norm_lang(language)
+    if lang == "fr":
+        return (
+            "Je comprends votre question. Cependant, la FAQ sur laquelle je suis basé(e) ne semble pas "
+            "contenir d’information spécifique sur ce sujet. Pour éviter d’inventer des informations médicales, "
+            "je ne peux pas répondre à partir de la FAQ.\n\n"
+            "Je vous recommande d’en parler avec votre équipe d’oncologie."
+        )
+    return (
+        "I understand why you’re asking. However, the FAQ I’m based on does not appear to contain specific "
+        "information about this topic. To avoid inventing medical information, I can’t answer this from the FAQ.\n\n"
+        "Please discuss this with your oncology team."
+    )
+
+
+def format_answer_no_llm(language: str, candidate: RetrievalCandidate) -> AnswerResult:
+    lang = _norm_lang(language)
+    if lang == "fr":
+        pre = "Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :\n\n"
+        src = f"— Source FAQ : “{candidate.question}” (section : {candidate.section})"
+    else:
+        pre = "Here is what the FAQ says about this topic (this does not replace advice from your care team):\n\n"
+        src = f"— FAQ source: “{candidate.question}” (section: {candidate.section})"
+
+    text = pre + candidate.answer.strip() + "\n\n" + src
+    return AnswerResult(
+        answered=True,
+        answer_text=text,
+        source_title=candidate.question,
+        source_section=candidate.section,
+        source_index=candidate.index,
+    )
+
+
+def answer_query(
+    retriever: HybridFAQRetriever,
+    user_query: str,
+    use_llm: bool = False,
+    llm_provider: str = "ollama",
+    openai_model: str = "gpt-4o-mini",
+    ollama_model: str = "llama3.2",
+    debug: bool = False,
+) -> AnswerResult:
+    """
+    1) retrieve candidates
+    2) answerability gate:
+       - require >=1 core keyword
+       - require at least one core keyword appears in corpus (questions/sections)
+    3) if answerable, answer from best candidate; optionally rephrase with LLM
+       IMPORTANT: LLM only runs when answered=True
+    """
+    lang = retriever.language
+    candidates = retriever.retrieve(user_query)
+
+    core_kws = extract_core_keywords(user_query, lang)
+    in_corpus = [k for k in core_kws if k in retriever._corpus_tokens]  # noqa: SLF001
+
+    dbg: Dict[str, Any] = {}
+    if debug:
+        dbg["core_kws"] = core_kws
+        dbg["in_corpus"] = in_corpus
+        dbg["top_candidates"] = [
+            {
+                "idx": c.index,
+                "fused": round(c.fused_score, 5),
+                "rerank": (round(c.rerank_score, 3) if c.rerank_score is not None else None),
+                "q": c.question[:120],
+            }
+            for c in candidates[:10]
+        ]
+
+    if len(core_kws) < 1:
+        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+    if len(in_corpus) < 1:
+        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+    if not candidates:
+        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+    best = candidates[0]
+    base = format_answer_no_llm(lang, best)
+
+    if use_llm:
+        rephraser = LLMRephraser(
+            provider=llm_provider,
+            language=lang,
+            openai_model=openai_model,
+            ollama_model=ollama_model,
+        )
+
+        rephrased_answer = rephraser.rephrase(user_query=user_query, faq_answer=best.answer.strip())
+
+        if lang == "fr":
+            pre = "Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :\n\n"
+            src = f"— Source FAQ : “{best.question}” (section : {best.section})"
+        else:
+            pre = "Here is what the FAQ says about this topic (this does not replace advice from your care team):\n\n"
+            src = f"— FAQ source: “{best.question}” (section: {best.section})"
+
+        base.answer_text = pre + rephrased_answer.strip() + "\n\n" + src
+
+    if debug:
+        base.debug = dbg
+
+    return base
+
+
+def print_debug(result: AnswerResult) -> None:
+    if not result.debug:
+        return
+    print("\n[DEBUG] core_kws:", result.debug.get("core_kws"))
+    print("[DEBUG] in_corpus:", result.debug.get("in_corpus"))
+    print("[DEBUG] Retrieved candidates:")
+    for row in result.debug.get("top_candidates", []):
+        print(f"  idx={row['idx']} fused={row['fused']} rerank={row['rerank']} | Q={row['q']}")
