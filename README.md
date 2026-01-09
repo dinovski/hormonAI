@@ -70,7 +70,7 @@ faq_<lang>_bm25.pkl         # BM25 index
 python chatbot.py -l en [--debug]
 ```
 
-## Run with re-ranking
+## Run with re-ranking (default is fused score)
 ```python
 python chatbot.py -l en --rerank 
 ```

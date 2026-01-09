@@ -55,7 +55,7 @@ EN_KEEP = {
     "pregnancy","recurrence","tamoxifen","letrozole","anastrozole","exemestane",
     "aromatase","inhibitor","clot","clots","thrombosis","embolism",
     "fertility","child","pause","sun","uv","mri","mammogram",
-    "depression","hot","flushes","bone","osteoporosis","cholesterol",
+    "depression","hot","flushes","bone","osteoporosis","cholesterol","cardiovascular","heart",
 }
 
 FR_KEEP = {
@@ -63,10 +63,9 @@ FR_KEEP = {
     "anastrozole","exemestane","aromatase","inhibiteur","thrombose","embolie",
     "fertilité","fertilite","enfant","pause","soleil","uv","irm","mammographie",
     "dépression","depression","bouffées","bouffees","os","ostéoporose","osteoporose",
-    "cholestérol","cholesterol",
+    "cholestérol","cholesterol","cardiovasculaire","coeur","cœur",
 }
 
-# Drug/treatment words should NOT count as “anchors”
 DRUG_TREATMENT_EN = {
     "tamoxifen","letrozole","anastrozole","exemestane",
     "aromatase","inhibitor","inhibitors",
@@ -297,7 +296,10 @@ class HybridFAQRetriever:
                 ce_scores = self._cross_encoder.predict(pairs)
                 for c, s in zip(candidates, ce_scores):
                     c.rerank_score = float(s)
-                candidates.sort(key=lambda c: c.rerank_score if c.rerank_score is not None else -1e9, reverse=True)
+                candidates.sort(
+                    key=lambda c: c.rerank_score if c.rerank_score is not None else -1e9,
+                    reverse=True,
+                )
             except Exception:
                 pass
 
@@ -314,7 +316,7 @@ class LLMRephraser:
         language: str,
         model: str = "llama3.2",
         temperature: float = 0.2,
-        max_tokens: int = 450,
+        max_tokens: int = 600,
         timeout_s: int = 60,
     ):
         self.language = _norm_lang(language)
@@ -326,30 +328,40 @@ class LLMRephraser:
     def _system_prompt(self) -> str:
         if self.language == "fr":
             return (
-                "Tu es un assistant empathique, STRICTEMENT limité au texte fourni. "
-                "Tu dois REFORMULER fidèlement le texte FAQ, sans ajouter, supprimer ou modifier des faits. "
-                "Aucune déduction clinique. Aucun avis personnalisé. Conserve les puces si présentes."
+                "Tu es un assistant empathique. "
+                "Tu dois UNIQUEMENT reformuler le texte fourni, sans ajouter, supprimer ou modifier des faits. "
+                "Aucune déduction clinique, aucun conseil personnalisé. "
+                "Ne fais pas de méta-commentaires (ex: 'Voici la reformulation'). "
+                "Utilise des formulations et des structures de phrases différentes dans la mesure du possible, tout en conservant le sens."
+                "Conserve tous les paragraphes et listes à puces. "
+                "Ne mentionne pas 'Block' ou 'Section:' dans la réponse."
             )
         return (
-            "You are an empathetic assistant STRICTLY limited to provided text. "
-            "You must REPHRASE the provided FAQ text without adding, removing, or changing facts. "
-            "No clinical inferences. No personalized advice. Preserve bullet points if present."
+            "You are an empathetic assistant. "
+            "You must ONLY rephrase the provided text without adding, removing, or changing facts. "
+            "No clinical inferences, no personalized advice. "
+            "Do not add meta-commentary (e.g., 'Here is the rephrased text'). "
+            "Use different wording and sentence structure where possible while preserving meaning."
+            "Keep all paragraphs and bullet points. "
+            "Do not mention 'Block' or include 'Section:' in the output."
         )
 
-    def _user_prompt(self, user_query: str, faq_answer: str) -> str:
+    def _user_prompt(self, user_query: str, text_to_rephrase: str) -> str:
         if self.language == "fr":
             return (
                 f"Question de l'utilisateur:\n{user_query}\n\n"
-                f"Texte FAQ (à reformuler fidèlement):\n{faq_answer}\n\n"
-                "Réponse (reformulation fidèle, chaleureuse, sans nouveaux faits):"
+                "Texte à reformuler fidèlement (sans nouveaux faits):\n"
+                f"{text_to_rephrase}\n\n"
+                "Réponse (reformulation fidèle, chaleureuse):"
             )
         return (
             f"User question:\n{user_query}\n\n"
-            f"FAQ text (rephrase faithfully):\n{faq_answer}\n\n"
-            "Answer (faithful rephrase, warm tone, no new facts):"
+            "Text to rephrase faithfully (no new facts):\n"
+            f"{text_to_rephrase}\n\n"
+            "Answer (faithful rephrase, warm tone):"
         )
 
-    def rephrase(self, user_query: str, faq_answer: str) -> str:
+    def rephrase(self, user_query: str, text_to_rephrase: str) -> str:
         import urllib.request
 
         base = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -357,22 +369,32 @@ class LLMRephraser:
 
         payload = {
             "model": self.model,
-            "prompt": self._user_prompt(user_query, faq_answer),
+            "prompt": self._user_prompt(user_query, text_to_rephrase),
             "system": self._system_prompt(),
             "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+            },
         }
 
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
+        # check if LLM was callsed
+        if os.getenv("HORMONAI_LLM_DEBUG", "0") == "1":
+            print(f"[LLM] Calling Ollama model={self.model} host={os.getenv('OLLAMA_HOST','http://localhost:11434')}")
+
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 out = json.loads(resp.read().decode("utf-8"))
             txt = (out.get("response") or "").strip()
-            return txt or faq_answer
-        except Exception:
-            return faq_answer
+            return txt or text_to_rephrase
+        except Exception as e:
+            if os.getenv("HORMONAI_LLM_DEBUG", "0") == "1":
+                print(f"[LLM] Ollama call failed: {type(e).__name__}: {e}")
+            return text_to_rephrase
+
 
 
 # ---------------------------
@@ -395,45 +417,110 @@ def build_abstain(language: str) -> str:
     )
 
 
-def format_answer_no_llm(language: str, candidate: RetrievalCandidate) -> AnswerResult:
-    lang = _norm_lang(language)
-    if lang == "fr":
-        pre = "**Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
-        src = f"**— Source FAQ :** “{candidate.question}” (section : {candidate.section})"
-    else:
-        pre = "**Here is what the FAQ says about this topic (this does not replace advice from your care team):**\n\n"
-        src = f"**— FAQ source:** “{candidate.question}” (section: {candidate.section})"
-
-    text = pre + candidate.answer.strip() + "\n\n" + src
-    return AnswerResult(
-        answered=True,
-        answer_text=text,
-        source_title=candidate.question,
-        source_section=candidate.section,
-        source_index=candidate.index,
-    )
-
-
 def _score_candidate(c: RetrievalCandidate) -> float:
     return float(c.rerank_score) if c.rerank_score is not None else float(c.fused_score)
 
 
+def _is_grounded(c: RetrievalCandidate, anchors: List[str]) -> bool:
+    if _contains_any_anchor(c.question, anchors):
+        return True
+    if _contains_any_anchor(f"{c.question} {c.section}", anchors):
+        return True
+    if _contains_any_anchor(f"{c.question} {c.section} {c.answer}", anchors):
+        return True
+    return False
+
+
 def _find_best_grounded_candidate(candidates: List[RetrievalCandidate], anchors: List[str]) -> Optional[RetrievalCandidate]:
     ranked = sorted(candidates, key=_score_candidate, reverse=True)
-
     for c in ranked:
-        if _contains_any_anchor(c.question, anchors):
+        if _is_grounded(c, anchors):
             return c
-
-    for c in ranked:
-        if _contains_any_anchor(f"{c.question} {c.section}", anchors):
-            return c
-
-    for c in ranked:
-        if _contains_any_anchor(f"{c.question} {c.section} {c.answer}", anchors):
-            return c
-
     return None
+
+
+def _select_close_bundle(
+    candidates: List[RetrievalCandidate],
+    anchors: List[str],
+    max_n: int = 3,
+    close_delta_rerank: float = 0.15,
+    close_delta_fused: float = 0.003,
+) -> List[RetrievalCandidate]:
+    if not candidates:
+        return []
+
+    ranked = sorted(candidates, key=_score_candidate, reverse=True)
+
+    best = None
+    for c in ranked:
+        if _is_grounded(c, anchors):
+            best = c
+            break
+    if best is None:
+        return []
+
+    best_score = _score_candidate(best)
+    has_rerank = best.rerank_score is not None
+    close_delta = close_delta_rerank if has_rerank else close_delta_fused
+
+    bundle: List[RetrievalCandidate] = [best]
+    used_idx = {best.index}
+
+    for c in ranked:
+        if c.index in used_idx:
+            continue
+        if not _is_grounded(c, anchors):
+            continue
+        if (best_score - _score_candidate(c)) <= close_delta:
+            bundle.append(c)
+            used_idx.add(c.index)
+        if len(bundle) >= max_n:
+            break
+
+    return bundle
+
+
+def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
+    """
+    This is what we feed to the LLM (if enabled): human-readable, no block markers,
+    no section labels, no citations.
+    """
+    lang = _norm_lang(language)
+    if not bundle:
+        return ""
+
+    parts: List[str] = []
+    for c in bundle:
+        # Bold question title for readability in the final answer
+        parts.append(f"**{c.question.strip()}**\n{c.answer.strip()}")
+
+    return "\n\n".join(parts).strip()
+
+
+def _format_preface(language: str) -> str:
+    lang = _norm_lang(language)
+    if lang == "fr":
+        return "**Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
+    return "**Here is what the FAQ says about this topic (this does not replace advice from your care team):**\n\n"
+
+
+def _format_sources(language: str, bundle: List[RetrievalCandidate]) -> str:
+    lang = _norm_lang(language)
+    lines: List[str] = []
+    if lang == "fr":
+        for c in bundle:
+            lines.append(f"**— Source FAQ :** “{c.question}” (section : {c.section})")
+    else:
+        for c in bundle:
+            lines.append(f"**— FAQ source:** “{c.question}” (section: {c.section})")
+    return "\n\n".join(lines).strip()
+
+
+def _format_full_answer(language: str, body: str, sources: str) -> str:
+    pre = _format_preface(language)
+    if sources:
+        return (pre + (body or "").strip() + "\n\n" + sources).strip()
+    return (pre + (body or "").strip()).strip()
 
 
 def answer_query(
@@ -472,55 +559,50 @@ def answer_query(
     if best is None:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    # margin check (kept)
-    anchor_in_question = _contains_any_anchor(best.question, anchors)
-
-    ranked = sorted(candidates, key=_score_candidate, reverse=True)
-    best_score = _score_candidate(best)
-
-    second_grounded = None
-    for c in ranked:
-        if c.index == best.index:
-            continue
-        if _contains_any_anchor(f"{c.question} {c.section}", anchors) or _contains_any_anchor(
-            f"{c.question} {c.section} {c.answer}", anchors
-        ):
-            second_grounded = c
-            break
-
-    second_score = _score_candidate(second_grounded) if second_grounded else 0.0
-    margin = best_score - second_score
-    has_rerank = best.rerank_score is not None
-    min_margin = 0.08 if has_rerank else 0.002
+    # Close-score bundle to avoid omitting nearly-tied relevant answers
+    bundle = _select_close_bundle(
+        candidates=candidates,
+        anchors=anchors,
+        max_n=3,
+        close_delta_rerank=0.15,
+        close_delta_fused=0.003,
+    )
 
     if debug:
-        dbg["chosen_best"] = {"idx": best.index, "q": best.question, "score": best_score}
-        dbg["anchor_in_question"] = anchor_in_question
-        dbg["margin"] = margin
-        dbg["min_margin"] = min_margin
+        dbg["chosen_best"] = {"idx": best.index, "q": best.question, "score": _score_candidate(best)}
+        dbg["bundle"] = [{"idx": c.index, "q": c.question, "score": _score_candidate(c)} for c in bundle]
 
-    if (not anchor_in_question) and second_grounded is not None and margin < min_margin:
+    if not bundle:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    base = format_answer_no_llm(lang, best)
+    body = _format_bundle_body(lang, bundle)
+    sources = _format_sources(lang, bundle)
 
+    # No-LLM answer
+    final_body = body
+
+    # debug LLM usage
+    dbg["use_llm"] = use_llm
+    dbg["llm_model"] = llm_model
+    dbg["llm_changed"] = (final_body.strip() != body.strip())
+
+    # LLM rephrase ONLY when we have a valid FAQ answer body
     if use_llm:
         rephraser = LLMRephraser(language=lang, model=llm_model)
-        rephrased_answer = rephraser.rephrase(user_query=user_query, faq_answer=best.answer.strip())
+        final_body = rephraser.rephrase(user_query=user_query, text_to_rephrase=body).strip() or body
 
-        if lang == "fr":
-            pre = "**Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
-            src = f"**— Source FAQ :** “{best.question}” (section : {best.section})"
-        else:
-            pre = "**Here is what the FAQ says about this topic (this does not replace advice from your care team):**\n\n"
-            src = f"**— FAQ source:** “{best.question}” (section: {best.section})"
+    answer_text = _format_full_answer(lang, final_body, sources)
 
-        base.answer_text = pre + rephrased_answer.strip() + "\n\n" + src
-
-    if debug:
-        base.debug = dbg
-
-    return base
+    top = bundle[0]
+    out = AnswerResult(
+        answered=True,
+        answer_text=answer_text,
+        source_title=top.question,
+        source_section=top.section,
+        source_index=top.index,
+        debug=(dbg if debug else None),
+    )
+    return out
 
 
 def print_debug(result: AnswerResult) -> None:
@@ -534,5 +616,5 @@ def print_debug(result: AnswerResult) -> None:
         print(f"  idx={row['idx']} fused={row['fused']} rerank={row['rerank']} | Q={row['q']}")
     if "chosen_best" in result.debug:
         print("[DEBUG] chosen_best:", result.debug.get("chosen_best"))
-        print("[DEBUG] anchor_in_question:", result.debug.get("anchor_in_question"))
-        print("[DEBUG] margin:", result.debug.get("margin"), "min_margin:", result.debug.get("min_margin"))
+    if "bundle" in result.debug:
+        print("[DEBUG] bundle:", result.debug.get("bundle"))
