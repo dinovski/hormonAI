@@ -12,10 +12,43 @@ It is designed to:
 
 ## Features
 - Language switch: fully updates UI + retrieval
-- LLM toggle: FAQ text only vs empathetic rephrasing
+- Hybrid retrieval: vector search (semantic) and BM25 (keyword)
 - Source transparency: every answer cites its FAQ origin
+- LLM toggle: FAQ text only vs empathetic rephrasing
 - Safety guardrails: out-of-scope questions are declined
 - Queries are logged for auditing and source material improvement
+
+## Scoring
+1) Retrieval produces a fused score (default)
+
+For every query, `HybridFAQRetriever.retrieve()` runs **three retrieval channels**:
+
+1. **BM25** over tokenized query vs BM25 docs (built from *section + question* only)
+2. **FAISS index over “Q-only” embeddings**
+3. **FAISS index over “QA” embeddings** (question + answer text)
+
+Each channel returns a top-k ranked list of FAQ indices. These ranks are then combined using **Reciprocal Rank Fusion (RRF)**:
+
+* For each index `idx`, we sum:
+  `rrf(rank) = 1 / (60 + rank)`
+  across BM25 + FAISS(Q) + FAISS(QA).
+
+That sum is stored as `RetrievalCandidate.fused_score`.
+
+`fused_score` is **not a similarity score**; it’s a **rank-fusion score**. It’s useful for ordering but its absolute value has no standalone meaning.
+
+2) Optional reranking produces rerank_score (only when enabled)
+
+If `HybridFAQRetriever(rerank=True)` and CrossEncoder loads successfully:
+* Create pairs:
+  `(user_query, section + question + answer)`
+* The CrossEncoder predicts a relevance score for each candidate.
+* Store it as `RetrievalCandidate.rerank_score`.
+* Sort candidates by rerank_score descending, overriding fused ordering.
+
+
+* `fused_score` = the hybrid retrieval “first-pass” ordering
+* `rerank_score` = second-pass reordering using a CrossEncoder
 
 ---
 
