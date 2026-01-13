@@ -6,7 +6,7 @@ import json
 import pickle
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import faiss
@@ -31,7 +31,18 @@ def _norm_lang(lang: str) -> str:
 
 
 def _tokenize(text: str) -> List[str]:
-    return re.findall(r"\b[\w\-']+\b", (text or "").lower())
+    """
+    Tokenize more conservatively:
+    - split on apostrophes (so "I'm" -> ["i","m"])
+    - keep only alnum + hyphen
+    This prevents contractions from becoming anchors.
+    """
+    return re.findall(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", (text or "").lower())
+
+
+def _has_number_or_percent(text: str) -> bool:
+    t = text or ""
+    return bool(re.search(r"(\d+(\.\d+)?)\s*%|\b\d+(\.\d+)?\b", t))
 
 
 # ---------------------------
@@ -48,6 +59,8 @@ EN_STOPWORDS = {
     "i","you","we","they","he","she","it","my","your","our","their",
     "this","that","these","those",
     "what","why","how","when","where","which",
+    # common contraction leftovers
+    "m","im","ive","id","ill","dont","cant","wont","youre","were","theyre","isnt","arent",
 }
 
 FR_STOPWORDS = {
@@ -57,14 +70,18 @@ FR_STOPWORDS = {
     "je","tu","il","elle","nous","vous","ils","elles",
     "ce","cet","cette","ces",
     "quoi","pourquoi","comment","quand","où","ou","quel","quelle","quels","quelles",
+    # common contraction leftovers
+    "j","t","c","d","l","n","qu",
 }
 
+# Generic domain words that are too broad to be anchors on their own
 GENERIC_EN = {
     "safe","safety","careful","need","should","can","could","would","risk","danger",
     "allowed","ok","okay","possible","recommend","recommended","advice",
     "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
     "take","taking","taken",
     "get","getting","got",
+    "health",  # too broad as an anchor
 }
 
 GENERIC_FR = {
@@ -73,6 +90,19 @@ GENERIC_FR = {
     "hormone","hormonale","hormonothérapie","hormonotherapie",
     "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
     "prendre","prends","pris",
+    "sante","santé",  # too broad
+}
+
+# Emotion / concern language: should not drive retrieval gating
+EMOTION_EN = {
+    "worried","worry","concerned","concern","anxious","anxiety","scared","afraid",
+    "fear","terrified","panic","panicking","stressed","stress","upset",
+}
+
+EMOTION_FR = {
+    "inquiet","inquiete","inquiète","inquiét","inquietude","inquiétude",
+    "angoisse","angoissé","angoissee","peur","effrayé","effrayee",
+    "stress","stresse","stressé","stressée","préoccupé","preoccupe","préoccupée","preoccupee",
 }
 
 DRUG_TREATMENT_EN = {
@@ -87,6 +117,36 @@ DRUG_TREATMENT_FR = {
     "hormone","hormonale","hormonothérapie","hormonotherapie",
     "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
 }
+
+
+# ---------------------------
+# "Stats intent" detection
+# ---------------------------
+
+STATS_HINTS_EN = {
+    "percent","percentage","proportion","rate","prevalence","incidence","how","many","often",
+    "odds","chance","probability","likelihood","frequency",
+}
+
+STATS_HINTS_FR = {
+    "pourcentage","percent","proportion","taux","prévalence","prevalence","incidence",
+    "combien","souvent","probabilité","probabilite","fréquence","frequence",
+}
+
+
+def _is_stats_intent(user_query: str, language: str) -> bool:
+    lang = _norm_lang(language)
+    toks = set(_tokenize(user_query))
+    hints = STATS_HINTS_FR if lang == "fr" else STATS_HINTS_EN
+    if "%" in (user_query or ""):
+        return True
+    return len(toks.intersection(hints)) > 0
+
+
+def _stats_anchor_stems(language: str) -> Set[str]:
+    lang = _norm_lang(language)
+    hints = STATS_HINTS_FR if lang == "fr" else STATS_HINTS_EN
+    return {_stem(h, lang) for h in hints}
 
 
 # ---------------------------
@@ -150,22 +210,38 @@ def _stem_set(tokens: List[str], language: str) -> Set[str]:
     return {_stem(t, language) for t in tokens if t}
 
 
+def _emotion_stems(language: str) -> Set[str]:
+    lang = _norm_lang(language)
+    words = EMOTION_FR if lang == "fr" else EMOTION_EN
+    return {_stem(w, lang) for w in words}
+
+
 # ---------------------------
 # Keyword extraction / anchors
 # ---------------------------
 
 def extract_core_keywords(user_query: str, language: str) -> List[str]:
+    """
+    Extract core keywords (anchors candidate concepts).
+    Filters:
+      - stopwords
+      - generic domain words
+      - emotion/concern words
+    """
     lang = _norm_lang(language)
     toks = _tokenize(user_query)
 
     stop = FR_STOPWORDS if lang == "fr" else EN_STOPWORDS
     gen = GENERIC_FR if lang == "fr" else GENERIC_EN
+    emo = EMOTION_FR if lang == "fr" else EMOTION_EN
 
     out: List[str] = []
     for t in toks:
         if t in stop:
             continue
         if t in gen:
+            continue
+        if t in emo:
             continue
         if len(t) <= 2:
             continue
@@ -181,6 +257,9 @@ def extract_core_keywords(user_query: str, language: str) -> List[str]:
 
 
 def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
+    """
+    Remove treatment/drug words so they don’t become anchors.
+    """
     lang = _norm_lang(language)
     drugset = DRUG_TREATMENT_FR if lang == "fr" else DRUG_TREATMENT_EN
     anchors = [k for k in core_kws if k not in drugset]
@@ -194,13 +273,10 @@ def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
     return out
 
 
-def _contains_any_anchor(text: str, anchors: List[str], language: str) -> bool:
-    hay = (text or "").lower()
-    if any(a.lower() in hay for a in anchors):
-        return True
-    hay_stems = _stem_set(_tokenize(hay), language)
-    anchor_stems = _stem_set([a.lower() for a in anchors], language)
-    return len(hay_stems.intersection(anchor_stems)) > 0
+def _anchor_overlap_stems(text: str, anchor_stems: Set[str], language: str) -> Set[str]:
+    toks = _tokenize(text or "")
+    stems = _stem_set(toks, language)
+    return stems.intersection(anchor_stems)
 
 
 # ---------------------------
@@ -256,9 +332,6 @@ class HybridFAQRetriever:
         self._embedder: Optional[SentenceTransformer] = None
         self._cross_encoder = None
 
-        self._corpus_tokens: Set[str] = set()
-        self._corpus_stems: Set[str] = set()
-
         self._stored_embedding_model_name: Optional[str] = None
 
     def load(self) -> None:
@@ -296,13 +369,6 @@ class HybridFAQRetriever:
                 f"Embedding dimension mismatch: FAISS index expects d={expected_dim} "
                 f"but embedding model '{self.embedding_model_name}' outputs d={model_dim}.{hint}"
             )
-
-        corpus_text = " ".join(
-            [f"{it.get('section','')} {it.get('question','')} {it.get('answer','')}" for it in self._items]
-        )
-        toks = _tokenize(corpus_text)
-        self._corpus_tokens = set(toks)
-        self._corpus_stems = _stem_set(toks, self.language)
 
         if self.rerank:
             try:
@@ -379,14 +445,10 @@ class HybridFAQRetriever:
 
 
 # ---------------------------
-# Formatting functions (requested)
+# Formatting functions
 # ---------------------------
 
 def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
-    """
-    This is what we feed to the LLM (if enabled): human-readable, no block markers,
-    no section labels, no citations.
-    """
     if not bundle:
         return ""
     parts: List[str] = []
@@ -422,13 +484,13 @@ def _format_full_answer(language: str, body: str, sources: str) -> str:
 
 
 # ---------------------------
-# Empathy bank (generic, question-agnostic)
+# Empathy bank (generic)
 # ---------------------------
 
 _EMPATHY_BANK_EN = [
     "I’m glad you asked — it’s completely understandable to have questions about this.",
     "Thank you for asking. It makes sense to want clarity and reassurance.",
-    "I hear you — these questions are very valid, and you’re not alone in wondering.",
+    "I hear you — this is a valid question, and you’re not alone in wondering.",
     "It’s understandable to want a clear answer here, especially with everything you’re managing.",
     "That’s a reasonable question to ask.",
     "I’m here with you — it’s okay to seek reassurance and clear information.",
@@ -465,17 +527,10 @@ def _fallback_empathy(language: str, user_query: str, top_question: str) -> str:
 
 
 # ---------------------------
-# LLM: write ONLY tone wrapper (NO medical facts)
+# LLM: tone wrapper ONLY (NO facts)
 # ---------------------------
 
 class LLMWrapperWriter:
-    """
-    Generates ONLY an empathetic wrapper:
-      - 1–2 sentences of empathy/validation
-      - optional 1 sentence suggesting discussing with the medical team
-    It must NOT include any medical facts or practical details.
-    The factual FAQ content is appended verbatim outside the LLM.
-    """
     def __init__(
         self,
         language: str,
@@ -498,7 +553,8 @@ class LLMWrapperWriter:
                 "UNE phrase invitant à en parler avec l'équipe soignante.\n\n"
                 "RÈGLES STRICTES:\n"
                 "- N'écris AUCUN fait médical, aucun détail pratique.\n"
-                "- N'invente rien sur la situation de la personne (pas de durée, pas d'hypothèses).\n"
+                "- N'invente rien sur la situation de la personne.\n"
+                "- Ne donne aucune statistique, aucun ordre de grandeur, aucune explication technique.\n"
                 "- N'inclus pas de citations, ni de sections.\n"
                 "- 2–3 phrases MAX.\n"
             )
@@ -508,7 +564,8 @@ class LLMWrapperWriter:
             "ONE sentence encouraging the person to discuss with their medical/care team.\n\n"
             "STRICT RULES:\n"
             "- Provide NO medical facts and no practical details.\n"
-            "- Do not assume anything about the person’s situation (no durations, no 'you have been taking...').\n"
+            "- Do not assume anything about the person’s situation.\n"
+            "- Do not provide statistics, magnitudes, or technical explanations.\n"
             "- No citations/sections.\n"
             "- 2–3 sentences MAX.\n"
         )
@@ -555,7 +612,7 @@ class LLMWrapperWriter:
 
 
 # ---------------------------
-# Answer logic + grounding
+# Abstain
 # ---------------------------
 
 def build_abstain(language: str) -> str:
@@ -574,34 +631,115 @@ def build_abstain(language: str) -> str:
     )
 
 
+# ---------------------------
+# Scoring + adaptive grounding using EFFECTIVE anchors
+# ---------------------------
+
 def _score_candidate(c: RetrievalCandidate) -> float:
     return float(c.rerank_score) if c.rerank_score is not None else float(c.fused_score)
 
 
-def _is_grounded(c: RetrievalCandidate, anchors: List[str], language: str) -> bool:
-    if _contains_any_anchor(c.question, anchors, language):
-        return True
-    if _contains_any_anchor(f"{c.question} {c.section}", anchors, language):
-        return True
-    if _contains_any_anchor(f"{c.question} {c.section} {c.answer}", anchors, language):
-        return True
-    return False
+def _passes_adaptive_grounding(
+    c: RetrievalCandidate,
+    language: str,
+    anchor_stems: Set[str],
+    stats_intent: bool,
+    stats_stems: Set[str],
+    concept_stems: Set[str],
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Adaptive grounding:
+      - Build an EFFECTIVE anchor set by removing emotion stems.
+      - Use effective anchors for strictness decisions.
+
+    Overlap rules:
+      - If effective anchor stems size <= 1: require >=1 overlap in QUESTION (or question+section)
+      - Else: require >=2 overlaps in (question+section)
+
+    If stats_intent:
+      - Must contain a number/% somewhere
+      - Must match at least one stats stem somewhere
+      - Must match at least one concept stem somewhere
+      - Still must satisfy overlap rule
+    """
+    lang = _norm_lang(language)
+
+    emo_stems = _emotion_stems(lang)
+    effective_anchor_stems = set(anchor_stems) - set(emo_stems)
+
+    n_eff = len(effective_anchor_stems)
+    min_qs_overlap = 1 if n_eff <= 1 else 2
+
+    q_overlap = _anchor_overlap_stems(c.question, effective_anchor_stems, lang)
+    qs_overlap = _anchor_overlap_stems(f"{c.question} {c.section}", effective_anchor_stems, lang)
+    all_text = f"{c.question} {c.section} {c.answer}"
+    all_overlap = _anchor_overlap_stems(all_text, effective_anchor_stems, lang)
+
+    if min_qs_overlap == 1:
+        overlap_ok = (len(q_overlap) >= 1) or (len(qs_overlap) >= 1)
+    else:
+        overlap_ok = len(qs_overlap) >= min_qs_overlap
+
+    details: Dict[str, Any] = {
+        "n_anchor_stems_raw": len(anchor_stems),
+        "n_anchor_stems_effective": n_eff,
+        "min_qs_overlap": min_qs_overlap,
+        "q_overlap_count": len(q_overlap),
+        "q_overlap_stems": sorted(list(q_overlap))[:20],
+        "qs_overlap_count": len(qs_overlap),
+        "qs_overlap_stems": sorted(list(qs_overlap))[:20],
+        "all_overlap_count": len(all_overlap),
+        "stats_intent": stats_intent,
+    }
+
+    if not stats_intent:
+        return (overlap_ok, details)
+
+    has_num = _has_number_or_percent(all_text)
+    has_stats = len(_anchor_overlap_stems(all_text, stats_stems, lang)) > 0
+    has_concept = len(_anchor_overlap_stems(all_text, concept_stems, lang)) > 0
+
+    details.update({
+        "has_number": has_num,
+        "has_stats_stem": has_stats,
+        "has_concept_stem": has_concept,
+    })
+
+    ok = overlap_ok and has_num and has_stats and has_concept
+    return (ok, details)
 
 
 def _find_best_grounded_candidate(
-    candidates: List[RetrievalCandidate], anchors: List[str], language: str
-) -> Optional[RetrievalCandidate]:
+    candidates: List[RetrievalCandidate],
+    language: str,
+    anchor_stems: Set[str],
+    stats_intent: bool,
+    stats_stems: Set[str],
+    concept_stems: Set[str],
+) -> Tuple[Optional[RetrievalCandidate], Optional[Dict[str, Any]]]:
     ranked = sorted(candidates, key=_score_candidate, reverse=True)
     for c in ranked:
-        if _is_grounded(c, anchors, language):
-            return c
-    return None
+        ok, details = _passes_adaptive_grounding(
+            c=c,
+            language=language,
+            anchor_stems=anchor_stems,
+            stats_intent=stats_intent,
+            stats_stems=stats_stems,
+            concept_stems=concept_stems,
+        )
+        if ok:
+            return c, details
+    return None, None
 
 
 def _select_close_bundle(
     candidates: List[RetrievalCandidate],
-    anchors: List[str],
+    best: RetrievalCandidate,
     language: str,
+    anchor_stems: Set[str],
+    stats_intent: bool,
+    stats_stems: Set[str],
+    concept_stems: Set[str],
     max_n: int = 3,
     close_delta_rerank: float = 0.15,
     close_delta_fused: float = 0.003,
@@ -610,14 +748,6 @@ def _select_close_bundle(
         return []
 
     ranked = sorted(candidates, key=_score_candidate, reverse=True)
-
-    best = None
-    for c in ranked:
-        if _is_grounded(c, anchors, language):
-            best = c
-            break
-    if best is None:
-        return []
 
     best_score = _score_candidate(best)
     has_rerank = best.rerank_score is not None
@@ -629,7 +759,15 @@ def _select_close_bundle(
     for c in ranked:
         if c.index in used_idx:
             continue
-        if not _is_grounded(c, anchors, language):
+        ok, _ = _passes_adaptive_grounding(
+            c=c,
+            language=language,
+            anchor_stems=anchor_stems,
+            stats_intent=stats_intent,
+            stats_stems=stats_stems,
+            concept_stems=concept_stems,
+        )
+        if not ok:
             continue
         if (best_score - _score_candidate(c)) <= close_delta:
             bundle.append(c)
@@ -639,6 +777,10 @@ def _select_close_bundle(
 
     return bundle
 
+
+# ---------------------------
+# Main answer function
+# ---------------------------
 
 def answer_query(
     retriever: HybridFAQRetriever,
@@ -652,38 +794,59 @@ def answer_query(
 
     core_kws = extract_core_keywords(user_query, lang)
     anchors = anchor_keywords(core_kws, lang)
+    anchor_stems = _stem_set(anchors, lang)
+
+    stats_intent = _is_stats_intent(user_query, lang)
+    stats_stems = _stats_anchor_stems(lang)
+    concept_stems = set(anchor_stems) - set(stats_stems)
 
     dbg: Dict[str, Any] = {}
     if debug:
         dbg["core_kws"] = core_kws
         dbg["anchors"] = anchors
-        dbg["anchor_stems"] = sorted(list(_stem_set(anchors, lang)))
-        dbg["use_llm"] = use_llm
-        dbg["llm_model"] = llm_model
+        dbg["anchor_stems"] = sorted(list(anchor_stems))[:40]
+        dbg["stats_intent"] = stats_intent
         dbg["top_candidates"] = [
             {"idx": c.index, "fused": round(c.fused_score, 5),
              "rerank": (round(c.rerank_score, 3) if c.rerank_score is not None else None),
-             "q": c.question[:120]}
+             "q": c.question[:120], "section": c.section[:120]}
             for c in candidates[:10]
         ]
 
     if len(core_kws) < 1 or len(anchors) < 1 or not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    best = _find_best_grounded_candidate(candidates, anchors, lang)
+    best, best_grounding_details = _find_best_grounded_candidate(
+        candidates=candidates,
+        language=lang,
+        anchor_stems=anchor_stems,
+        stats_intent=stats_intent,
+        stats_stems=stats_stems,
+        concept_stems=concept_stems,
+    )
+
+    if debug:
+        dbg["best_grounding"] = best_grounding_details
+
     if best is None:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    bundle = _select_close_bundle(candidates, anchors, lang)
+    bundle = _select_close_bundle(
+        candidates=candidates,
+        best=best,
+        language=lang,
+        anchor_stems=anchor_stems,
+        stats_intent=stats_intent,
+        stats_stems=stats_stems,
+        concept_stems=concept_stems,
+    )
     if not bundle:
         bundle = [best]
 
-    # Factual content is ALWAYS verbatim from FAQ bundle.
     faq_body = _format_bundle_body(lang, bundle)
     sources = _format_sources(lang, bundle)
     factual_block = _format_full_answer(lang, faq_body, sources)
 
-    # Empathy wrapper: try LLM; fallback to generic bank if empty/fails.
     prefix = ""
     if use_llm:
         wrapper = LLMWrapperWriter(language=lang, model=llm_model).write(user_query=user_query).strip()
@@ -710,10 +873,16 @@ def answer_query(
 def print_debug(result: AnswerResult) -> None:
     if not result.debug:
         return
+
     print("\n[DEBUG] core_kws:", result.debug.get("core_kws"))
     print("[DEBUG] anchors:", result.debug.get("anchors"))
     print("[DEBUG] anchor_stems:", result.debug.get("anchor_stems"))
-    print("[DEBUG] use_llm:", result.debug.get("use_llm"), "llm_model:", result.debug.get("llm_model"))
+    print("[DEBUG] stats_intent:", result.debug.get("stats_intent"))
+
+    bg = result.debug.get("best_grounding")
+    if bg:
+        print("[DEBUG] best_grounding:", bg)
+
     print("[DEBUG] Retrieved candidates:")
     for row in result.debug.get("top_candidates", []):
         print(f"  idx={row['idx']} fused={row['fused']} rerank={row['rerank']} | Q={row['q']}")

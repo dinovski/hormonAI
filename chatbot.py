@@ -5,7 +5,7 @@ chatbot.py
 CLI for hormonAI.
 
 Key rule:
-- LLM is ONLY used to rephrase an already-answered FAQ response.
+- LLM is ONLY used to add a tone wrapper to an already-answered FAQ response.
 - Abstains NEVER go to the LLM.
 """
 
@@ -27,8 +27,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rerank", action="store_true", help="Enable CrossEncoder reranking (better, slower).")
     p.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 
-    # Simplified LLM: Ollama-only
-    p.add_argument("--use-llm", action="store_true", help="Rephrase answers with an LLM (ONLY for answered queries).")
+    p.add_argument("--use-llm", action="store_true", help="Add an empathetic tone wrapper with an LLM (ONLY for answered queries).")
     p.add_argument("--llm-model", default="llama3.2", help="Ollama model name (default: llama3.2).")
 
     p.add_argument("--debug", action="store_true")
@@ -84,7 +83,6 @@ def main() -> None:
         if args.debug:
             print_debug(result)
 
-        # AUDIT (no PHI; still be mindful in production)
         logger.log_query(
             query=user,
             language=args.language,
