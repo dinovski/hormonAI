@@ -1,4 +1,4 @@
-![hormonAI](hormonAI.png)
+![hormonAI](hormonAI_transparent.png)
 
 *A compassionate, FAQ-restricted RAG chatbot for adjuvant hormone therapy*
 
