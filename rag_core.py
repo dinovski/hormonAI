@@ -31,7 +31,6 @@ def _norm_lang(lang: str) -> str:
 
 
 def _tokenize(text: str) -> List[str]:
-    # Split contractions; keep alnum + hyphen chunks
     return re.findall(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", (text or "").lower())
 
 
@@ -54,8 +53,8 @@ EN_STOPWORDS = {
     "i","you","we","they","he","she","it","my","your","our","their",
     "this","that","these","those",
     "what","why","how","when","where","which",
-    # contraction leftovers
     "m","im","ive","id","ill","dont","cant","wont","youre","were","theyre","isnt","arent",
+    "have","having",
 }
 
 FR_STOPWORDS = {
@@ -65,8 +64,8 @@ FR_STOPWORDS = {
     "je","tu","il","elle","nous","vous","ils","elles",
     "ce","cet","cette","ces",
     "quoi","pourquoi","comment","quand","où","ou","quel","quelle","quels","quelles",
-    # contraction leftovers
     "j","t","c","d","l","n","qu",
+    "ai","as","avons","avez","ont","avais","avait","aviez","avaient",
 }
 
 GENERIC_EN = {
@@ -75,7 +74,8 @@ GENERIC_EN = {
     "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
     "take","taking","taken",
     "get","getting","got",
-    "health",  # too broad
+    "health",
+    "issue","issues","problem","problems","symptom","symptoms","trouble","troubles",
 }
 
 GENERIC_FR = {
@@ -85,6 +85,7 @@ GENERIC_FR = {
     "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
     "prendre","prends","pris",
     "sante","santé",
+    "problème","probleme","problèmes","problemes","souci","soucis","symptôme","symptome","symptômes","symptomes",
 }
 
 EMOTION_EN = {
@@ -113,33 +114,46 @@ DRUG_TREATMENT_FR = {
 
 
 # ---------------------------
-# Stats intent detection
+# Stats intent vs stats grounding (FIX)
 # ---------------------------
 
-STATS_HINTS_EN = {
-    "percent","percentage","proportion","rate","prevalence","incidence","how","many","often",
+# Broad: detect that user is asking for stats
+STATS_INTENT_HINTS_EN = {
+    "percent","percentage","proportion","rate","prevalence","incidence",
+    "how","many","often",
     "odds","chance","probability","likelihood","frequency",
 }
 
-STATS_HINTS_FR = {
+STATS_INTENT_HINTS_FR = {
     "pourcentage","percent","proportion","taux","prévalence","prevalence","incidence",
-    "combien","souvent","probabilité","probabilite","fréquence","frequence",
+    "combien","souvent",
+    "probabilité","probabilite","fréquence","frequence",
 }
+
+# Strict: require candidate to actually be “stats-like”
+# IMPORTANT: NO "how", "many", "often" here — those cause false positives via section titles.
+STATS_GROUND_HINTS_EN = {
+    "percent","percentage","proportion","rate","prevalence","incidence",
+    "odds","chance","probability","likelihood","frequency",
+}
+
+STATS_GROUND_HINTS_FR = {
+    "pourcentage","percent","proportion","taux","prévalence","prevalence","incidence",
+    "probabilité","probabilite","fréquence","frequence",
+}
+
+# For stats queries, ignore broad concepts that would match almost anything.
+STATS_BROAD_CONCEPTS_EN = {"cancer", "patient", "patients", "people", "person", "persons", "breast"}
+STATS_BROAD_CONCEPTS_FR = {"cancer", "patient", "patients", "personne", "personnes", "sein"}
 
 
 def _is_stats_intent(user_query: str, language: str) -> bool:
     lang = _norm_lang(language)
     toks = set(_tokenize(user_query))
-    hints = STATS_HINTS_FR if lang == "fr" else STATS_HINTS_EN
+    hints = STATS_INTENT_HINTS_FR if lang == "fr" else STATS_INTENT_HINTS_EN
     if "%" in (user_query or ""):
         return True
     return len(toks.intersection(hints)) > 0
-
-
-def _stats_anchor_stems(language: str) -> Set[str]:
-    lang = _norm_lang(language)
-    hints = STATS_HINTS_FR if lang == "fr" else STATS_HINTS_EN
-    return {_stem(h, lang) for h in hints}
 
 
 # ---------------------------
@@ -210,16 +224,45 @@ def _emotion_stems(language: str) -> Set[str]:
 
 
 # ---------------------------
+# Lay ↔ clinical synonym sets (MATCHING ONLY)
+# ---------------------------
+
+def _concept_match_stems(concept_stem: str, language: str) -> Set[str]:
+    lang = _norm_lang(language)
+
+    if lang == "en":
+        m = {
+            _stem("heart", "en"): {_stem("heart", "en"), _stem("cardiovascular", "en"), _stem("cardio", "en")},
+            _stem("cardiovascular", "en"): {_stem("cardiovascular", "en"), _stem("heart", "en"), _stem("cardio", "en")},
+            _stem("bone", "en"): {_stem("bone", "en"), _stem("osteoporosis", "en"), _stem("osteoporotic", "en")},
+        }
+        return m.get(concept_stem, {concept_stem})
+
+    m_fr = {
+        _stem("coeur", "fr"): {_stem("coeur", "fr"), _stem("cardiovasculaire", "fr"), _stem("cardio", "fr")},
+        _stem("cardiovasculaire", "fr"): {_stem("cardiovasculaire", "fr"), _stem("coeur", "fr"), _stem("cardio", "fr")},
+        _stem("os", "fr"): {_stem("os", "fr"), _stem("ostéoporose", "fr"), _stem("osteoporose", "fr")},
+    }
+    return m_fr.get(concept_stem, {concept_stem})
+
+
+def _anchor_overlap_concepts(text: str, anchor_concepts: Set[str], language: str) -> Set[str]:
+    lang = _norm_lang(language)
+    text_stems = _stem_set(_tokenize(text or ""), lang)
+
+    covered: Set[str] = set()
+    for concept in anchor_concepts:
+        acceptable = _concept_match_stems(concept, lang)
+        if len(text_stems.intersection(acceptable)) > 0:
+            covered.add(concept)
+    return covered
+
+
+# ---------------------------
 # Keyword extraction / anchors
 # ---------------------------
 
 def extract_core_keywords(user_query: str, language: str) -> List[str]:
-    """
-    Filters out:
-      - stopwords
-      - generic domain words ("health", "safe", etc.)
-      - emotion words ("worried", etc.)
-    """
     lang = _norm_lang(language)
     toks = _tokenize(user_query)
 
@@ -262,12 +305,6 @@ def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
     return out
 
 
-def _anchor_overlap_stems(text: str, anchor_stems: Set[str], language: str) -> Set[str]:
-    toks = _tokenize(text or "")
-    stems = _stem_set(toks, language)
-    return stems.intersection(anchor_stems)
-
-
 # ---------------------------
 # Dataclasses
 # ---------------------------
@@ -293,7 +330,7 @@ class AnswerResult:
 
 
 # ---------------------------
-# Hybrid Retriever (with optional paraphrase index)
+# Hybrid Retriever
 # ---------------------------
 
 class HybridFAQRetriever:
@@ -318,7 +355,7 @@ class HybridFAQRetriever:
         self._bm25: Optional[BM25Okapi] = None
         self._index_q: Optional[faiss.Index] = None
         self._index_qa: Optional[faiss.Index] = None
-        self._index_qp: Optional[faiss.Index] = None  # optional: question+paraphrases index
+        self._index_qp: Optional[faiss.Index] = None
         self._embedder: Optional[SentenceTransformer] = None
         self._cross_encoder = None
 
@@ -330,7 +367,7 @@ class HybridFAQRetriever:
         bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
         idx_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
         idx_qa_path = os.path.join(self.data_dir, f"{prefix}_index_qa.faiss")
-        idx_qp_path = os.path.join(self.data_dir, f"{prefix}_index_qp.faiss")  # optional
+        idx_qp_path = os.path.join(self.data_dir, f"{prefix}_index_qp.faiss")
 
         with open(qa_path, "rb") as f:
             payload = pickle.load(f)
@@ -344,7 +381,6 @@ class HybridFAQRetriever:
         self._index_q = faiss.read_index(idx_q_path)
         self._index_qa = faiss.read_index(idx_qa_path)
 
-        # Optional paraphrase-augmented question index
         if os.path.exists(idx_qp_path):
             try:
                 self._index_qp = faiss.read_index(idx_qp_path)
@@ -355,7 +391,6 @@ class HybridFAQRetriever:
 
         self._embedder = SentenceTransformer(self.embedding_model_name)
 
-        # Defensive: embedding dim mismatch check
         expected_dim = int(getattr(self._index_q, "d", -1))
         model_dim = int(self._embedder.get_sentence_embedding_dimension())
         if expected_dim > 0 and expected_dim != model_dim:
@@ -374,7 +409,6 @@ class HybridFAQRetriever:
         if self._index_qp is not None:
             qp_dim = int(getattr(self._index_qp, "d", -1))
             if qp_dim > 0 and qp_dim != model_dim:
-                # If qp index exists but wrong dimension, ignore it rather than crash
                 self._index_qp = None
 
         if self.rerank:
@@ -428,7 +462,6 @@ class HybridFAQRetriever:
         for r, idx in enumerate(Iqa[0].tolist()):
             if idx >= 0:
                 fused[int(idx)] = fused.get(int(idx), 0.0) + rrf(r)
-
         if Iqp is not None:
             for r, idx in enumerate(Iqp[0].tolist()):
                 if idx >= 0:
@@ -466,11 +499,10 @@ class HybridFAQRetriever:
 
 
 # ---------------------------
-# Formatting functions (you asked to keep these)
+# Formatting functions
 # ---------------------------
 
 def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
-    lang = _norm_lang(language)
     if not bundle:
         return ""
     parts: List[str] = []
@@ -506,23 +538,23 @@ def _format_full_answer(language: str, body: str, sources: str) -> str:
 
 
 # ---------------------------
-# Empathy bank (generic, question-agnostic)
+# Empathy + LLM wrapper (unchanged behavior)
 # ---------------------------
 
 _EMPATHY_BANK_EN = [
-    "Thank you for asking — it’s completely understandable to want clarity and reassurance.",
-    "I hear you. This is a very reasonable question, and it’s okay to look for a clear answer.",
-    "It makes sense to want to feel confident about what’s safe and appropriate.",
-    "You’re not alone in wondering about this — it’s completely valid to ask.",
-    "It’s understandable to want straightforward, reliable information, especially with everything you’re managing.",
+    "Thank you for sharing that — it’s completely understandable to want reassurance.",
+    "I hear you. It’s very reasonable to be thinking about this.",
+    "It makes sense to want clear, reliable guidance about your health.",
+    "You’re not alone in asking this — it’s a valid concern.",
+    "It’s understandable to want straightforward information, especially with everything you’re managing.",
 ]
 
 _EMPATHY_BANK_FR = [
-    "Merci de poser la question — c’est tout à fait normal de vouloir une réponse claire et rassurante.",
-    "Je vous comprends. C’est une question très raisonnable, et c’est légitime de chercher une réponse claire.",
-    "C’est normal de vouloir se sentir en confiance sur ce qui est sûr et approprié.",
-    "Vous n’êtes pas seul(e) à vous poser cette question — elle est tout à fait valable.",
-    "C’est compréhensible de vouloir une information simple et fiable, surtout avec tout ce que vous traversez.",
+    "Merci de le partager — c’est tout à fait normal de vouloir être rassuré(e).",
+    "Je vous comprends. C’est une inquiétude très légitime.",
+    "C’est normal de vouloir une information claire et fiable sur votre santé.",
+    "Vous n’êtes pas seul(e) à vous poser la question — c’est une préoccupation valable.",
+    "C’est compréhensible de vouloir une réponse simple et fiable, surtout avec tout ce que vous traversez.",
 ]
 
 
@@ -541,10 +573,6 @@ def _fallback_empathy(language: str, user_query: str, top_question: str) -> str:
     s = _stable_choice(bank, key)
     return (s.strip() + "\n\n") if s else ""
 
-
-# ---------------------------
-# LLM: tone wrapper ONLY (NO facts)
-# ---------------------------
 
 class LLMWrapperWriter:
     def __init__(
@@ -602,14 +630,8 @@ class LLMWrapperWriter:
             "prompt": self._user_prompt(user_query),
             "system": self._system_prompt(),
             "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            },
+            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
         }
-
-        if os.getenv("HORMONAI_LLM_DEBUG", "0") == "1":
-            print(f"[LLM] Calling Ollama host={base} model={self.model}")
 
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -617,13 +639,8 @@ class LLMWrapperWriter:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 out = json.loads(resp.read().decode("utf-8"))
-            txt = (out.get("response") or "").strip()
-            if os.getenv("HORMONAI_LLM_DEBUG", "0") == "1":
-                print(f"[LLM] Got {len(txt)} chars back")
-            return txt
-        except Exception as e:
-            if os.getenv("HORMONAI_LLM_DEBUG", "0") == "1":
-                print(f"[LLM] Ollama call failed: {type(e).__name__}: {e}")
+            return (out.get("response") or "").strip()
+        except Exception:
             return ""
 
 
@@ -648,143 +665,99 @@ def build_abstain(language: str) -> str:
 
 
 # ---------------------------
-# Grounding gate (adaptive + stats guard)
+# Scoring + selection
 # ---------------------------
 
 def _score_candidate(c: RetrievalCandidate) -> float:
     return float(c.rerank_score) if c.rerank_score is not None else float(c.fused_score)
 
 
-def _passes_adaptive_grounding(
-    c: RetrievalCandidate,
-    language: str,
-    anchor_stems_raw: Set[str],
-    stats_intent: bool,
-    stats_stems: Set[str],
-    concept_stems: Set[str],
-) -> Tuple[bool, Dict[str, Any]]:
-    lang = _norm_lang(language)
-
-    # Effective anchors: remove emotion stems
-    emo = _emotion_stems(lang)
-    anchor_stems = set(anchor_stems_raw) - set(emo)
-
-    n_eff = len(anchor_stems)
-    min_qs_overlap = 1 if n_eff <= 1 else 2
-
-    q_overlap = _anchor_overlap_stems(c.question, anchor_stems, lang)
-    qs_overlap = _anchor_overlap_stems(f"{c.question} {c.section}", anchor_stems, lang)
-    all_text = f"{c.question} {c.section} {c.answer}"
-
-    if min_qs_overlap == 1:
-        overlap_ok = (len(q_overlap) >= 1) or (len(qs_overlap) >= 1)
-    else:
-        overlap_ok = len(qs_overlap) >= min_qs_overlap
-
-    details: Dict[str, Any] = {
-        "n_anchor_stems_raw": len(anchor_stems_raw),
-        "n_anchor_stems_effective": n_eff,
-        "min_qs_overlap": min_qs_overlap,
-        "q_overlap_count": len(q_overlap),
-        "q_overlap_stems": sorted(list(q_overlap))[:20],
-        "qs_overlap_count": len(qs_overlap),
-        "qs_overlap_stems": sorted(list(qs_overlap))[:20],
-        "stats_intent": stats_intent,
-    }
-
-    if not stats_intent:
-        return overlap_ok, details
-
-    # Stats-only: must actually contain numbers and match stats+concept stems
-    has_num = _has_number_or_percent(all_text)
-    has_stats = len(_anchor_overlap_stems(all_text, stats_stems, lang)) > 0
-    has_concept = len(_anchor_overlap_stems(all_text, concept_stems, lang)) > 0
-
-    details.update({
-        "has_number": has_num,
-        "has_stats_stem": has_stats,
-        "has_concept_stem": has_concept,
-    })
-
-    ok = overlap_ok and has_num and has_stats and has_concept
-    return ok, details
-
-
-def _find_best_grounded_candidate(
+def _select_bundle_with_coverage(
     candidates: List[RetrievalCandidate],
     language: str,
-    anchor_stems: Set[str],
-    stats_intent: bool,
-    stats_stems: Set[str],
-    concept_stems: Set[str],
-) -> Tuple[Optional[RetrievalCandidate], Optional[Dict[str, Any]]]:
-    ranked = sorted(candidates, key=_score_candidate, reverse=True)
-    for c in ranked:
-        ok, details = _passes_adaptive_grounding(
-            c=c,
-            language=language,
-            anchor_stems_raw=anchor_stems,
-            stats_intent=stats_intent,
-            stats_stems=stats_stems,
-            concept_stems=concept_stems,
-        )
-        if ok:
-            return c, details
-    return None, None
-
-
-def _select_close_bundle(
-    candidates: List[RetrievalCandidate],
-    best: RetrievalCandidate,
-    language: str,
-    anchor_stems: Set[str],
-    stats_intent: bool,
-    stats_stems: Set[str],
-    concept_stems: Set[str],
+    anchor_concepts: Set[str],
     max_n: int = 3,
-    close_delta_rerank: float = 0.15,
-    close_delta_fused: float = 0.003,
-) -> List[RetrievalCandidate]:
-    if not candidates:
-        return []
-
+) -> Tuple[List[RetrievalCandidate], Dict[str, Any]]:
+    lang = _norm_lang(language)
     ranked = sorted(candidates, key=_score_candidate, reverse=True)
 
-    best_score = _score_candidate(best)
-    has_rerank = best.rerank_score is not None
-    close_delta = close_delta_rerank if has_rerank else close_delta_fused
-
-    bundle: List[RetrievalCandidate] = [best]
-    used_idx = {best.index}
+    covered: Set[str] = set()
+    bundle: List[RetrievalCandidate] = []
+    per_candidate_covered: List[Dict[str, Any]] = []
 
     for c in ranked:
-        if c.index in used_idx:
-            continue
-        ok, _ = _passes_adaptive_grounding(
-            c=c,
-            language=language,
-            anchor_stems_raw=anchor_stems,
-            stats_intent=stats_intent,
-            stats_stems=stats_stems,
-            concept_stems=concept_stems,
-        )
-        if not ok:
-            continue
-        if (best_score - _score_candidate(c)) <= close_delta:
-            bundle.append(c)
-            used_idx.add(c.index)
         if len(bundle) >= max_n:
             break
 
-    return bundle
+        text = f"{c.question} {c.section} {c.answer}"
+        cov = _anchor_overlap_concepts(text, anchor_concepts, lang)
+
+        if not cov:
+            continue
+        if cov.issubset(covered):
+            continue
+
+        bundle.append(c)
+        covered |= cov
+        per_candidate_covered.append({"idx": c.index, "covered_concepts": sorted(list(cov))})
+
+        if covered == anchor_concepts:
+            break
+
+    details = {
+        "required_concepts": sorted(list(anchor_concepts)),
+        "covered_concepts": sorted(list(covered)),
+        "coverage_complete": covered == anchor_concepts,
+        "bundle_cover_debug": per_candidate_covered,
+    }
+    return bundle, details
 
 
 # ---------------------------
-# Main answer function (API used by chatbot.py)
+# FIXED: Stats gate
+# ---------------------------
+
+def _passes_stats_gate(text: str, language: str) -> bool:
+    """
+    Stats answers must:
+      - contain a number/percent
+      - contain a strict stats marker (NOT "how")
+    """
+    lang = _norm_lang(language)
+    if not _has_number_or_percent(text):
+        return False
+
+    hints = STATS_GROUND_HINTS_FR if lang == "fr" else STATS_GROUND_HINTS_EN
+    hint_stems = {_stem(x, lang) for x in hints}
+    text_stems = _stem_set(_tokenize(text), lang)
+    return len(text_stems.intersection(hint_stems)) > 0
+
+
+def _stats_concept_stems_to_require(anchor_concepts: Set[str], language: str) -> Set[str]:
+    """
+    For stats queries, require overlap with at least one non-broad concept.
+    E.g. genetics/mutation should be required; cancer/patient should not.
+    """
+    lang = _norm_lang(language)
+
+    # remove stats-intent stems from concept set (e.g., percent)
+    intent_hints = STATS_INTENT_HINTS_FR if lang == "fr" else STATS_INTENT_HINTS_EN
+    intent_stems = {_stem(x, lang) for x in intent_hints}
+    concepts = set(anchor_concepts) - set(intent_stems)
+
+    broad = STATS_BROAD_CONCEPTS_FR if lang == "fr" else STATS_BROAD_CONCEPTS_EN
+    broad_stems = {_stem(x, lang) for x in broad}
+    concepts = concepts - broad_stems
+
+    return concepts
+
+
+# ---------------------------
+# Main answer function
 # ---------------------------
 
 def answer_query(
-    retriever: HybridFAQRetriever,
+    retriever: "HybridFAQRetriever",
     user_query: str,
     use_llm: bool = False,
     llm_model: str = "llama3.2",
@@ -795,17 +768,15 @@ def answer_query(
 
     core_kws = extract_core_keywords(user_query, lang)
     anchors = anchor_keywords(core_kws, lang)
-    anchor_stems = _stem_set(anchors, lang)
+    anchor_concepts = _stem_set(anchors, lang)
 
     stats_intent = _is_stats_intent(user_query, lang)
-    stats_stems = _stats_anchor_stems(lang)
-    concept_stems = set(anchor_stems) - set(stats_stems)
 
     dbg: Dict[str, Any] = {}
     if debug:
         dbg["core_kws"] = core_kws
         dbg["anchors"] = anchors
-        dbg["anchor_stems"] = sorted(list(anchor_stems))[:40]
+        dbg["anchor_stems"] = sorted(list(anchor_concepts))[:40]
         dbg["stats_intent"] = stats_intent
         dbg["qp_index_loaded"] = (retriever._index_qp is not None)  # type: ignore[attr-defined]
         dbg["top_candidates"] = [
@@ -815,53 +786,72 @@ def answer_query(
             for c in candidates[:10]
         ]
 
-    # If we can't extract any meaningful anchors, abstain (keeps you safe)
     if len(core_kws) < 1 or len(anchors) < 1 or not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    best, best_grounding_details = _find_best_grounded_candidate(
-        candidates=candidates,
-        language=lang,
-        anchor_stems=anchor_stems,
-        stats_intent=stats_intent,
-        stats_stems=stats_stems,
-        concept_stems=concept_stems,
-    )
+    # -----------------------
+    # Stats questions: strict guard
+    # -----------------------
+    if stats_intent:
+        required_concepts = _stats_concept_stems_to_require(anchor_concepts, lang)
 
-    if debug:
-        dbg["best_grounding"] = best_grounding_details
+        if debug:
+            dbg["stats_required_concepts"] = sorted(list(required_concepts))[:20]
 
-    if best is None:
-        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+        ok_stats_candidates: List[RetrievalCandidate] = []
+        for c in candidates:
+            text = f"{c.question} {c.section} {c.answer}"
 
-    bundle = _select_close_bundle(
-        candidates=candidates,
-        best=best,
-        language=lang,
-        anchor_stems=anchor_stems,
-        stats_intent=stats_intent,
-        stats_stems=stats_stems,
-        concept_stems=concept_stems,
-    )
-    if not bundle:
+            # must be stats-like
+            if not _passes_stats_gate(text, lang):
+                continue
+
+            # must match at least one non-broad concept if we have any
+            if required_concepts:
+                cov = _anchor_overlap_concepts(text, required_concepts, lang)
+                if not cov:
+                    continue
+
+            ok_stats_candidates.append(c)
+
+        if debug:
+            dbg["stats_gate_candidates"] = [{"idx": c.index, "q": c.question[:120]} for c in ok_stats_candidates[:10]]
+
+        if not ok_stats_candidates:
+            return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+        best = sorted(ok_stats_candidates, key=_score_candidate, reverse=True)[0]
         bundle = [best]
 
+    else:
+        # -----------------------
+        # Non-stats: multi-anchor coverage when needed
+        # -----------------------
+        if len(anchor_concepts) >= 2:
+            bundle, cov_details = _select_bundle_with_coverage(candidates, lang, anchor_concepts, max_n=3)
+            if debug:
+                dbg["coverage_gate"] = cov_details
+            if not cov_details["coverage_complete"]:
+                return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+        else:
+            bundle, cov_details = _select_bundle_with_coverage(candidates, lang, anchor_concepts, max_n=1)
+            if debug:
+                dbg["coverage_gate"] = cov_details
+            if not cov_details["coverage_complete"]:
+                return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+    # Build FAQ answer
     faq_body = _format_bundle_body(lang, bundle)
     sources = _format_sources(lang, bundle)
     factual_block = _format_full_answer(lang, faq_body, sources)
 
-    # Empathy: LLM tone wrapper if available; otherwise stable generic fallback
-    prefix = ""
+    # Empathy prefix (only when answering)
     if use_llm:
         wrapper = LLMWrapperWriter(language=lang, model=llm_model).write(user_query=user_query).strip()
-        if wrapper:
-            prefix = wrapper + "\n\n"
-        else:
-            prefix = _fallback_empathy(lang, user_query, bundle[0].question)
-            if debug:
-                dbg["llm_wrapper_fallback"] = True
+        prefix = (wrapper + "\n\n") if wrapper else _fallback_empathy(lang, user_query, bundle[0].question)
+        if debug and not wrapper:
+            dbg["llm_wrapper_fallback"] = True
     else:
-        # If LLM off, still keep answers caring but not repetitive across all questions
         prefix = _fallback_empathy(lang, user_query, bundle[0].question)
 
     answer_text = (prefix + factual_block).strip()
@@ -878,7 +868,7 @@ def answer_query(
 
 
 # ---------------------------
-# Debug printer (chatbot.py imports this)
+# Debug printer
 # ---------------------------
 
 def print_debug(result: AnswerResult) -> None:
@@ -891,9 +881,14 @@ def print_debug(result: AnswerResult) -> None:
     print("[DEBUG] stats_intent:", result.debug.get("stats_intent"))
     print("[DEBUG] qp_index_loaded:", result.debug.get("qp_index_loaded"))
 
-    bg = result.debug.get("best_grounding")
-    if bg:
-        print("[DEBUG] best_grounding:", bg)
+    if "stats_required_concepts" in result.debug:
+        print("[DEBUG] stats_required_concepts:", result.debug.get("stats_required_concepts"))
+
+    if "coverage_gate" in result.debug:
+        print("[DEBUG] coverage_gate:", result.debug.get("coverage_gate"))
+
+    if "stats_gate_candidates" in result.debug:
+        print("[DEBUG] stats_gate_candidates:", result.debug.get("stats_gate_candidates"))
 
     print("[DEBUG] Retrieved candidates:")
     for row in result.debug.get("top_candidates", []):
