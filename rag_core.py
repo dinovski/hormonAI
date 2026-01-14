@@ -31,12 +31,7 @@ def _norm_lang(lang: str) -> str:
 
 
 def _tokenize(text: str) -> List[str]:
-    """
-    Tokenize more conservatively:
-    - split on apostrophes (so "I'm" -> ["i","m"])
-    - keep only alnum + hyphen
-    This prevents contractions from becoming anchors.
-    """
+    # Split contractions; keep alnum + hyphen chunks
     return re.findall(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*", (text or "").lower())
 
 
@@ -59,7 +54,7 @@ EN_STOPWORDS = {
     "i","you","we","they","he","she","it","my","your","our","their",
     "this","that","these","those",
     "what","why","how","when","where","which",
-    # common contraction leftovers
+    # contraction leftovers
     "m","im","ive","id","ill","dont","cant","wont","youre","were","theyre","isnt","arent",
 }
 
@@ -70,18 +65,17 @@ FR_STOPWORDS = {
     "je","tu","il","elle","nous","vous","ils","elles",
     "ce","cet","cette","ces",
     "quoi","pourquoi","comment","quand","où","ou","quel","quelle","quels","quelles",
-    # common contraction leftovers
+    # contraction leftovers
     "j","t","c","d","l","n","qu",
 }
 
-# Generic domain words that are too broad to be anchors on their own
 GENERIC_EN = {
     "safe","safety","careful","need","should","can","could","would","risk","danger",
     "allowed","ok","okay","possible","recommend","recommended","advice",
     "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
     "take","taking","taken",
     "get","getting","got",
-    "health",  # too broad as an anchor
+    "health",  # too broad
 }
 
 GENERIC_FR = {
@@ -90,10 +84,9 @@ GENERIC_FR = {
     "hormone","hormonale","hormonothérapie","hormonotherapie",
     "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
     "prendre","prends","pris",
-    "sante","santé",  # too broad
+    "sante","santé",
 }
 
-# Emotion / concern language: should not drive retrieval gating
 EMOTION_EN = {
     "worried","worry","concerned","concern","anxious","anxiety","scared","afraid",
     "fear","terrified","panic","panicking","stressed","stress","upset",
@@ -120,7 +113,7 @@ DRUG_TREATMENT_FR = {
 
 
 # ---------------------------
-# "Stats intent" detection
+# Stats intent detection
 # ---------------------------
 
 STATS_HINTS_EN = {
@@ -212,8 +205,8 @@ def _stem_set(tokens: List[str], language: str) -> Set[str]:
 
 def _emotion_stems(language: str) -> Set[str]:
     lang = _norm_lang(language)
-    words = EMOTION_FR if lang == "fr" else EMOTION_EN
-    return {_stem(w, lang) for w in words}
+    emo = EMOTION_FR if lang == "fr" else EMOTION_EN
+    return {_stem(w, lang) for w in emo}
 
 
 # ---------------------------
@@ -222,11 +215,10 @@ def _emotion_stems(language: str) -> Set[str]:
 
 def extract_core_keywords(user_query: str, language: str) -> List[str]:
     """
-    Extract core keywords (anchors candidate concepts).
-    Filters:
+    Filters out:
       - stopwords
-      - generic domain words
-      - emotion/concern words
+      - generic domain words ("health", "safe", etc.)
+      - emotion words ("worried", etc.)
     """
     lang = _norm_lang(language)
     toks = _tokenize(user_query)
@@ -257,9 +249,6 @@ def extract_core_keywords(user_query: str, language: str) -> List[str]:
 
 
 def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
-    """
-    Remove treatment/drug words so they don’t become anchors.
-    """
     lang = _norm_lang(language)
     drugset = DRUG_TREATMENT_FR if lang == "fr" else DRUG_TREATMENT_EN
     anchors = [k for k in core_kws if k not in drugset]
@@ -304,7 +293,7 @@ class AnswerResult:
 
 
 # ---------------------------
-# Hybrid Retriever
+# Hybrid Retriever (with optional paraphrase index)
 # ---------------------------
 
 class HybridFAQRetriever:
@@ -329,6 +318,7 @@ class HybridFAQRetriever:
         self._bm25: Optional[BM25Okapi] = None
         self._index_q: Optional[faiss.Index] = None
         self._index_qa: Optional[faiss.Index] = None
+        self._index_qp: Optional[faiss.Index] = None  # optional: question+paraphrases index
         self._embedder: Optional[SentenceTransformer] = None
         self._cross_encoder = None
 
@@ -340,6 +330,7 @@ class HybridFAQRetriever:
         bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
         idx_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
         idx_qa_path = os.path.join(self.data_dir, f"{prefix}_index_qa.faiss")
+        idx_qp_path = os.path.join(self.data_dir, f"{prefix}_index_qp.faiss")  # optional
 
         with open(qa_path, "rb") as f:
             payload = pickle.load(f)
@@ -353,8 +344,18 @@ class HybridFAQRetriever:
         self._index_q = faiss.read_index(idx_q_path)
         self._index_qa = faiss.read_index(idx_qa_path)
 
+        # Optional paraphrase-augmented question index
+        if os.path.exists(idx_qp_path):
+            try:
+                self._index_qp = faiss.read_index(idx_qp_path)
+            except Exception:
+                self._index_qp = None
+        else:
+            self._index_qp = None
+
         self._embedder = SentenceTransformer(self.embedding_model_name)
 
+        # Defensive: embedding dim mismatch check
         expected_dim = int(getattr(self._index_q, "d", -1))
         model_dim = int(self._embedder.get_sentence_embedding_dimension())
         if expected_dim > 0 and expected_dim != model_dim:
@@ -369,6 +370,12 @@ class HybridFAQRetriever:
                 f"Embedding dimension mismatch: FAISS index expects d={expected_dim} "
                 f"but embedding model '{self.embedding_model_name}' outputs d={model_dim}.{hint}"
             )
+
+        if self._index_qp is not None:
+            qp_dim = int(getattr(self._index_qp, "d", -1))
+            if qp_dim > 0 and qp_dim != model_dim:
+                # If qp index exists but wrong dimension, ignore it rather than crash
+                self._index_qp = None
 
         if self.rerank:
             try:
@@ -396,8 +403,17 @@ class HybridFAQRetriever:
 
         q_emb = self._encode(f"Question: {user_query}")
         _, Iq = self._index_q.search(q_emb, self.top_k)
+
         qa_emb = self._encode(f"Question: {user_query}")
         _, Iqa = self._index_qa.search(qa_emb, self.top_k)
+
+        Iqp = None
+        if self._index_qp is not None:
+            try:
+                qp_emb = self._encode(f"Question: {user_query}")
+                _, Iqp = self._index_qp.search(qp_emb, self.top_k)
+            except Exception:
+                Iqp = None
 
         def rrf(rank: int, k: int = 60) -> float:
             return 1.0 / (k + rank)
@@ -412,6 +428,11 @@ class HybridFAQRetriever:
         for r, idx in enumerate(Iqa[0].tolist()):
             if idx >= 0:
                 fused[int(idx)] = fused.get(int(idx), 0.0) + rrf(r)
+
+        if Iqp is not None:
+            for r, idx in enumerate(Iqp[0].tolist()):
+                if idx >= 0:
+                    fused[int(idx)] = fused.get(int(idx), 0.0) + rrf(r)
 
         ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[: self.top_k]
 
@@ -445,10 +466,11 @@ class HybridFAQRetriever:
 
 
 # ---------------------------
-# Formatting functions
+# Formatting functions (you asked to keep these)
 # ---------------------------
 
 def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
+    lang = _norm_lang(language)
     if not bundle:
         return ""
     parts: List[str] = []
@@ -484,29 +506,23 @@ def _format_full_answer(language: str, body: str, sources: str) -> str:
 
 
 # ---------------------------
-# Empathy bank (generic)
+# Empathy bank (generic, question-agnostic)
 # ---------------------------
 
 _EMPATHY_BANK_EN = [
-    "I’m glad you asked — it’s completely understandable to have questions about this.",
-    "Thank you for asking. It makes sense to want clarity and reassurance.",
-    "I hear you — this is a valid question, and you’re not alone in wondering.",
-    "It’s understandable to want a clear answer here, especially with everything you’re managing.",
-    "That’s a reasonable question to ask.",
-    "I’m here with you — it’s okay to seek reassurance and clear information.",
-    "It makes sense to want to feel confident about what to do next.",
-    "Thank you for sharing your question — it’s important to feel supported and informed.",
+    "Thank you for asking — it’s completely understandable to want clarity and reassurance.",
+    "I hear you. This is a very reasonable question, and it’s okay to look for a clear answer.",
+    "It makes sense to want to feel confident about what’s safe and appropriate.",
+    "You’re not alone in wondering about this — it’s completely valid to ask.",
+    "It’s understandable to want straightforward, reliable information, especially with everything you’re managing.",
 ]
 
 _EMPATHY_BANK_FR = [
-    "Merci de poser la question — c’est tout à fait normal d’avoir des doutes ou des questions.",
-    "Je vous comprends. C’est légitime de chercher une réponse claire et rassurante.",
-    "Vous n’êtes pas seul(e) à vous poser ce type de question — elle est tout à fait valable.",
-    "C’est compréhensible de vouloir une réponse précise, surtout avec tout ce que vous traversez.",
-    "C’est une question très raisonnable.",
-    "Je suis là avec vous — c’est normal de chercher à être rassuré(e).",
-    "C’est légitime de vouloir se sentir en confiance pour la suite.",
-    "Merci d’en parler — c’est important de se sentir soutenu(e) et bien informé(e).",
+    "Merci de poser la question — c’est tout à fait normal de vouloir une réponse claire et rassurante.",
+    "Je vous comprends. C’est une question très raisonnable, et c’est légitime de chercher une réponse claire.",
+    "C’est normal de vouloir se sentir en confiance sur ce qui est sûr et approprié.",
+    "Vous n’êtes pas seul(e) à vous poser cette question — elle est tout à fait valable.",
+    "C’est compréhensible de vouloir une information simple et fiable, surtout avec tout ce que vous traversez.",
 ]
 
 
@@ -632,7 +648,7 @@ def build_abstain(language: str) -> str:
 
 
 # ---------------------------
-# Scoring + adaptive grounding using EFFECTIVE anchors
+# Grounding gate (adaptive + stats guard)
 # ---------------------------
 
 def _score_candidate(c: RetrievalCandidate) -> float:
@@ -642,38 +658,23 @@ def _score_candidate(c: RetrievalCandidate) -> float:
 def _passes_adaptive_grounding(
     c: RetrievalCandidate,
     language: str,
-    anchor_stems: Set[str],
+    anchor_stems_raw: Set[str],
     stats_intent: bool,
     stats_stems: Set[str],
     concept_stems: Set[str],
 ) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Adaptive grounding:
-      - Build an EFFECTIVE anchor set by removing emotion stems.
-      - Use effective anchors for strictness decisions.
-
-    Overlap rules:
-      - If effective anchor stems size <= 1: require >=1 overlap in QUESTION (or question+section)
-      - Else: require >=2 overlaps in (question+section)
-
-    If stats_intent:
-      - Must contain a number/% somewhere
-      - Must match at least one stats stem somewhere
-      - Must match at least one concept stem somewhere
-      - Still must satisfy overlap rule
-    """
     lang = _norm_lang(language)
 
-    emo_stems = _emotion_stems(lang)
-    effective_anchor_stems = set(anchor_stems) - set(emo_stems)
+    # Effective anchors: remove emotion stems
+    emo = _emotion_stems(lang)
+    anchor_stems = set(anchor_stems_raw) - set(emo)
 
-    n_eff = len(effective_anchor_stems)
+    n_eff = len(anchor_stems)
     min_qs_overlap = 1 if n_eff <= 1 else 2
 
-    q_overlap = _anchor_overlap_stems(c.question, effective_anchor_stems, lang)
-    qs_overlap = _anchor_overlap_stems(f"{c.question} {c.section}", effective_anchor_stems, lang)
+    q_overlap = _anchor_overlap_stems(c.question, anchor_stems, lang)
+    qs_overlap = _anchor_overlap_stems(f"{c.question} {c.section}", anchor_stems, lang)
     all_text = f"{c.question} {c.section} {c.answer}"
-    all_overlap = _anchor_overlap_stems(all_text, effective_anchor_stems, lang)
 
     if min_qs_overlap == 1:
         overlap_ok = (len(q_overlap) >= 1) or (len(qs_overlap) >= 1)
@@ -681,20 +682,20 @@ def _passes_adaptive_grounding(
         overlap_ok = len(qs_overlap) >= min_qs_overlap
 
     details: Dict[str, Any] = {
-        "n_anchor_stems_raw": len(anchor_stems),
+        "n_anchor_stems_raw": len(anchor_stems_raw),
         "n_anchor_stems_effective": n_eff,
         "min_qs_overlap": min_qs_overlap,
         "q_overlap_count": len(q_overlap),
         "q_overlap_stems": sorted(list(q_overlap))[:20],
         "qs_overlap_count": len(qs_overlap),
         "qs_overlap_stems": sorted(list(qs_overlap))[:20],
-        "all_overlap_count": len(all_overlap),
         "stats_intent": stats_intent,
     }
 
     if not stats_intent:
-        return (overlap_ok, details)
+        return overlap_ok, details
 
+    # Stats-only: must actually contain numbers and match stats+concept stems
     has_num = _has_number_or_percent(all_text)
     has_stats = len(_anchor_overlap_stems(all_text, stats_stems, lang)) > 0
     has_concept = len(_anchor_overlap_stems(all_text, concept_stems, lang)) > 0
@@ -706,7 +707,7 @@ def _passes_adaptive_grounding(
     })
 
     ok = overlap_ok and has_num and has_stats and has_concept
-    return (ok, details)
+    return ok, details
 
 
 def _find_best_grounded_candidate(
@@ -722,7 +723,7 @@ def _find_best_grounded_candidate(
         ok, details = _passes_adaptive_grounding(
             c=c,
             language=language,
-            anchor_stems=anchor_stems,
+            anchor_stems_raw=anchor_stems,
             stats_intent=stats_intent,
             stats_stems=stats_stems,
             concept_stems=concept_stems,
@@ -762,7 +763,7 @@ def _select_close_bundle(
         ok, _ = _passes_adaptive_grounding(
             c=c,
             language=language,
-            anchor_stems=anchor_stems,
+            anchor_stems_raw=anchor_stems,
             stats_intent=stats_intent,
             stats_stems=stats_stems,
             concept_stems=concept_stems,
@@ -779,7 +780,7 @@ def _select_close_bundle(
 
 
 # ---------------------------
-# Main answer function
+# Main answer function (API used by chatbot.py)
 # ---------------------------
 
 def answer_query(
@@ -806,13 +807,15 @@ def answer_query(
         dbg["anchors"] = anchors
         dbg["anchor_stems"] = sorted(list(anchor_stems))[:40]
         dbg["stats_intent"] = stats_intent
+        dbg["qp_index_loaded"] = (retriever._index_qp is not None)  # type: ignore[attr-defined]
         dbg["top_candidates"] = [
             {"idx": c.index, "fused": round(c.fused_score, 5),
              "rerank": (round(c.rerank_score, 3) if c.rerank_score is not None else None),
-             "q": c.question[:120], "section": c.section[:120]}
+             "q": c.question[:140], "section": c.section[:140]}
             for c in candidates[:10]
         ]
 
+    # If we can't extract any meaningful anchors, abstain (keeps you safe)
     if len(core_kws) < 1 or len(anchors) < 1 or not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
@@ -847,6 +850,7 @@ def answer_query(
     sources = _format_sources(lang, bundle)
     factual_block = _format_full_answer(lang, faq_body, sources)
 
+    # Empathy: LLM tone wrapper if available; otherwise stable generic fallback
     prefix = ""
     if use_llm:
         wrapper = LLMWrapperWriter(language=lang, model=llm_model).write(user_query=user_query).strip()
@@ -856,6 +860,9 @@ def answer_query(
             prefix = _fallback_empathy(lang, user_query, bundle[0].question)
             if debug:
                 dbg["llm_wrapper_fallback"] = True
+    else:
+        # If LLM off, still keep answers caring but not repetitive across all questions
+        prefix = _fallback_empathy(lang, user_query, bundle[0].question)
 
     answer_text = (prefix + factual_block).strip()
 
@@ -870,6 +877,10 @@ def answer_query(
     )
 
 
+# ---------------------------
+# Debug printer (chatbot.py imports this)
+# ---------------------------
+
 def print_debug(result: AnswerResult) -> None:
     if not result.debug:
         return
@@ -878,6 +889,7 @@ def print_debug(result: AnswerResult) -> None:
     print("[DEBUG] anchors:", result.debug.get("anchors"))
     print("[DEBUG] anchor_stems:", result.debug.get("anchor_stems"))
     print("[DEBUG] stats_intent:", result.debug.get("stats_intent"))
+    print("[DEBUG] qp_index_loaded:", result.debug.get("qp_index_loaded"))
 
     bg = result.debug.get("best_grounding")
     if bg:

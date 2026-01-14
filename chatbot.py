@@ -4,9 +4,10 @@ chatbot.py
 
 CLI for hormonAI.
 
-Key rule:
-- LLM is ONLY used to add a tone wrapper to an already-answered FAQ response.
-- Abstains NEVER go to the LLM.
+Key rules:
+- Retrieval is FAQ-only.
+- LLM (if enabled) is used ONLY for a short empathetic wrapper (no facts).
+- Answers always quote the FAQ content (no added medical facts).
 """
 
 from __future__ import annotations

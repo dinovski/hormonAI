@@ -21,11 +21,12 @@ It is designed to:
 ## Scoring
 1) Retrieval produces a fused score (default)
 
-For every query, `HybridFAQRetriever.retrieve()` runs **three retrieval channels**:
+For every query, `HybridFAQRetriever.retrieve()` runs **four retrieval channels**:
 
 1. **BM25** over tokenized query vs BM25 docs (built from *section + question* only)
 2. **FAISS index over “Q-only” embeddings**
-3. **FAISS index over “QA” embeddings** (question + answer text)
+3. **FAISS index over “Q rephrasing” embeddings** (optional)
+4. **FAISS index over “QA” embeddings** (question + answer text)
 
 Each channel returns a top-k ranked list of FAQ indices. These ranks are then combined using **Reciprocal Rank Fusion (RRF)**:
 
@@ -91,11 +92,20 @@ Builds a hybrid retriever:
 python ingest_faq.py -l en -d docs/20250613_FAQ_Hormono_EN.docx
 python ingest_faq.py -l fr -d docs/20250613_FAQ_Hormono_FR.docx
 ```
+
+## Ingest FAQ with question rephrasing (llama3.2)
+### Ensure Ollama is running http://localhost:11434
+```python
+python ingest_faq.py -l en --augment-questions --paraphrase-n 6 -d docs/20250613_FAQ_Hormono_EN.docx
+python ingest_faq.py -l fr --augment-questions --paraphrase-n 6 -d docs/20250613_FAQ_Hormono_FR.docx
+```
+
 ```text
-faq_<lang>_index_q.faiss    # FAISS index on questions
-faq_<lang>_index_qa.faiss   # FAISS index on question+answer
-faq_<lang>_qa.pkl           # Parsed FAQ items + metadata
-faq_<lang>_bm25.pkl         # BM25 index
+faq_<lang>_index_q.faiss      # FAISS index on questions
+faq_<lang>_index_qp.faiss  # FAISS index on augmented questions
+faq_<lang>_index_qa.faiss     # FAISS index on question+answer
+faq_<lang>_qa.pkl             # Parsed FAQ items + metadata
+faq_<lang>_bm25.pkl           # BM25 index
 ```
 
 ## Run hormonAI (CLI)
