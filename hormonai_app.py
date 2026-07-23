@@ -18,6 +18,84 @@ st.set_page_config(
 DEFAULT_LLM_MODEL = os.getenv("HORMONAI_LLM_MODEL", "llama3.2")
 
 
+# ---------- SAMPLE PROMPTS (from patient-forum research) ----------
+SAMPLE_PROMPTS = {
+    "en": {
+        "Side effects": [
+            "I'm on tamoxifen and I've had heartburn and joint pain for two weeks — is this normal or should I call my doctor?",
+            "How do I tell the difference between a side effect I can wait out and one that needs urgent attention?",
+        ],
+        "Uterine/endometrial cancer risk": [
+            "What symptoms would actually be a red flag for uterine cancer versus just a tamoxifen side effect?",
+        ],
+        "Starting or stopping treatment": [
+            "I'm worried about side effects and longterm health. How do I weigh that against my risk of recurrence if I don't take hormone therapy?",
+            "Is it ever okay to take a break from hormone therapy, or does that increase my risk?",
+        ],
+        "Mood, sleep, cognition": [
+            "My doctor says my insomnia and mood swings aren't from the medication — could they actually be related?",
+            "What can I ask my care team about managing depression or brain fog while on this treatment?",
+        ],
+        "Digestive symptoms": [
+            "What can I do about the stomach pain and heartburn I'm getting since starting tamoxifen?",
+        ],
+        "Managing side effects": [
+            "Are there ways to reduce side effects, like changing when I take my dose or switching brands?",
+            "What non-drug options are there for joint pain from aromatase inhibitors?",
+        ],
+        "Sexual and vaginal health": [
+            "Is it safe to use vaginal estrogen?",
+            "What are my options for painful sex or low libido on this treatment?",
+        ],
+        "Long-term monitoring": [
+            "What tests should I be getting regularly while on an aromatase inhibitor — bone scans, cholesterol, anything else?",
+            "Should I be worried about heart health on this medication?",
+        ],
+        "Duration and stopping": [
+            "How is the decision made about whether I need 5 vs 10 years of treatment?",
+            "What happens to my body when I eventually stop hormone therapy?",
+        ],
+    },
+    "fr": {
+        "Effets secondaires": [
+            "Je prends du tamoxifène et j'ai des brûlures d'estomac et des douleurs articulaires depuis deux semaines — est-ce normal ou dois-je appeler mon médecin ?",
+            "Comment faire la différence entre un effet secondaire à surveiller et un effet qui nécessite une attention urgente ?",
+        ],
+        "Risque de cancer de l'utérus/de l'endomètre": [
+            "J'ai remarqué plus de pertes vaginales depuis que j'ai commencé le tamoxifène — est-ce que cela pourrait signifier un cancer de l'utérus ?",
+            "Quels symptômes seraient réellement un signal d'alarme pour un cancer de l'utérus, par rapport à un simple effet secondaire du tamoxifène ?",
+        ],
+        "Commencer ou arrêter le traitement": [
+            "J'ai peur des effets secondaires — comment mettre cela en balance avec mon risque de récidive si je n'ai pas d'hormonothérapie ?",
+            "Est-ce parfois acceptable de faire une pause dans l'hormonothérapie, ou cela augmente-t-il mon risque ?",
+        ],
+        "Humeur, sommeil, cognition": [
+            "Mon médecin dit que mon insomnie et mes sautes d'humeur ne sont pas liées au médicament — est-ce que cela pourrait quand même être lié ?",
+            "Que puis-je demander à mon équipe soignante pour gérer la dépression ou le brouillard mental pendant ce traitement ?",
+        ],
+        "Symptômes digestifs": [
+            "Que puis-je faire contre les douleurs à l'estomac et les brûlures d'estomac depuis que j'ai commencé le tamoxifène ?",
+        ],
+        "Gérer les effets secondaires": [
+            "Existe-t-il des moyens de réduire les effets secondaires, comme changer l'heure de ma prise ou changer de marque ?",
+            "Quelles sont les options non médicamenteuses pour les douleurs articulaires liées aux inhibiteurs de l'aromatase ?",
+        ],
+        "Santé sexuelle et vaginale": [
+            "Est-il sûr d'utiliser des œstrogènes vaginaux contre la sécheresse ?",
+            "Quelles sont mes options en cas de rapports douloureux ou de baisse de libido pendant ce traitement ?",
+        ],
+        "Suivi à long terme": [
+            "Quels examens devrais-je faire régulièrement sous inhibiteur de l'aromatase — densité osseuse, cholestérol, autre chose ?",
+            "Dois-je m'inquiéter de ma santé cardiaque avec ce médicament ?",
+        ],
+        "Durée et arrêt du traitement": [
+            "Comment décide-t-on si j'ai besoin de 5 ou 10 ans de traitement ?",
+            "Que se passe-t-il dans mon corps quand j'arrête finalement l'hormonothérapie ?",
+        ],
+    },
+}
+
+
 # ---------- RENDER HELPERS ----------
 BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 
@@ -41,6 +119,20 @@ def render_bubble_text(text: str) -> str:
 st.markdown(
     """
     <style>
+    /* ---------------------------------------------------------
+       Force light-mode color variables at the source. Streamlit
+       auto-detects OS/browser dark mode and swaps internal CSS
+       variables (e.g. --text-color) to white; overriding the
+       variables themselves here fixes every widget that reads
+       from them, instead of patching each widget individually.
+       --------------------------------------------------------- */
+    :root, html, body {
+        color-scheme: light !important;
+        --text-color: #b26a7c !important;
+        --background-color: #ffffff !important;
+        --secondary-background-color: #ffeef6 !important;
+    }
+
     /* Global text color override: warm rose-plum, no black text */
     * {
         color: #b26a7c !important;
@@ -312,6 +404,33 @@ st.markdown(
         font-weight: 700;
         border: 1px solid #ffb3d2;
     }
+
+    /* ---------------------------------------------------------
+       FIX: expander header text was rendering white-on-light-pink
+       (unreadable). This happens because Streamlit's expander
+       label uses a CSS variable that resolves to white under
+       OS/browser dark mode, independent of our page background.
+       We force a strong dark pink here as a CSS-level backstop
+       (the primary fix is locking the Streamlit theme itself via
+       .streamlit/config.toml). Button text inside the expander is
+       excluded so the white-on-magenta sample-question buttons
+       are untouched.
+       --------------------------------------------------------- */
+    [data-testid="stExpander"] summary,
+    [data-testid="stExpander"] summary *,
+    [data-testid="stExpander"] [data-testid="stExpanderDetails"] > div > p,
+    [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p {
+        color: #99004d !important;
+        font-weight: 650 !important;
+    }
+
+    [data-testid="stExpander"] .stButton > button,
+    [data-testid="stExpander"] .stButton > button *,
+    [data-testid="stExpander"] [data-testid="stButton"] button,
+    [data-testid="stExpander"] [data-testid="stButton"] button * {
+        color: #99004d !important;
+        font-weight: 600 !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -366,6 +485,7 @@ Discutez toujours de votre situation et de toute décision thérapeutique direct
         "Utilise un modèle de re-ranking (CrossEncoder) pour réordonner les passages récupérés. "
         "Cela peut améliorer la pertinence, mais c’est plus lent et demande des dépendances supplémentaires."
     )
+    sample_prompts_label = "Vous ne savez pas comment formuler votre question ? Essayez l’une de celles-ci :"
 else:
     subtitle_text = "A breast cancer support chatbot prototype"
     expander_label = "About hormonAI & safety"
@@ -407,6 +527,7 @@ Always discuss your situation and any treatment decisions directly with your onc
         "Uses a CrossEncoder reranker to reorder retrieved FAQ entries. "
         "This can improve relevance, but it’s slower and requires extra dependencies."
     )
+    sample_prompts_label = "Not sure how to phrase your question? Try one of these:"
 
 # ---------- LOGO + TITLE ----------
 with st.container():
@@ -479,53 +600,6 @@ if language != st.session_state.last_language or use_rerank != st.session_state.
     st.session_state.last_language = language
     st.session_state.last_rerank = use_rerank
 
-# ---------- CHAT DISPLAY ----------
-st.markdown(f'<div class="chat-title">{chat_title_label}</div>', unsafe_allow_html=True)
-
-chat_container = st.container()
-
-with chat_container:
-    for msg in st.session_state.history:
-        if msg["role"] == "user":
-            safe_text = render_bubble_text(msg["content"])
-            user_html = f"""
-            <div class="chat-bubble-user">
-                <div class="chat-role">{'Vous' if language == 'fr' else 'You'}</div>
-                <div class="chat-content">{safe_text}</div>
-            </div>
-            """
-            st.markdown(user_html, unsafe_allow_html=True)
-
-        else:
-            safe_text = render_bubble_text(msg["content"])
-            bot_html = f"""
-            <div class="chat-bubble-bot">
-                <div class="chat-role">hormonAI</div>
-                <div class="chat-content">{safe_text}</div>
-            </div>
-            """
-            st.markdown(bot_html, unsafe_allow_html=True)
-
-            # ✅ Only show dropdown when we actually answered AND sources exist
-            if show_sources and msg.get("sources"):
-                exp_label = (
-                    "Sources de la FAQ utilisées pour cette réponse"
-                    if language == "fr"
-                    else "FAQ sources used for this answer"
-                )
-                with st.expander(exp_label):
-                    for i, src in enumerate(msg["sources"], start=1):
-                        st.markdown(
-                            f"**Source {i}** – score: <span class='score-pill'>{src['score']:.3f}</span>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(f"- **Section:** {src['section']}")
-                        st.markdown(f"- **Question:** {src['question']}")
-                        snippet = src["answer"]
-                        if len(snippet) > 350:
-                            snippet = snippet[:350] + "…"
-                        st.markdown(f"- **Answer snippet:** {snippet}")
-
 # ---------- HANDLE SEND ----------
 def _coerce_answer_result(res: object) -> tuple[bool, str]:
     if isinstance(res, dict):
@@ -595,6 +669,73 @@ def handle_send():
 
     st.session_state.user_input = ""
 
+
+def handle_sample_prompt_click(prompt_text: str):
+    """Place the sample prompt into the input box for the user to review/edit — does not submit."""
+    st.session_state.user_input = prompt_text
+
+
+# ---------- SAMPLE PROMPTS ----------
+prompts_for_lang = SAMPLE_PROMPTS.get(language, SAMPLE_PROMPTS["en"])
+
+with st.expander(sample_prompts_label):
+    for theme, prompts in prompts_for_lang.items():
+        st.markdown(f"**{theme}**")
+        for i, prompt_text in enumerate(prompts):
+            st.button(
+                prompt_text,
+                key=f"sample_prompt_{language}_{theme}_{i}",
+                use_container_width=True,
+                on_click=handle_sample_prompt_click,
+                args=(prompt_text,),
+            )
+
+# ---------- CHAT DISPLAY (kept immediately above the input box) ----------
+st.markdown(f'<div class="chat-title">{chat_title_label}</div>', unsafe_allow_html=True)
+
+chat_container = st.container()
+
+with chat_container:
+    for msg in st.session_state.history:
+        if msg["role"] == "user":
+            safe_text = render_bubble_text(msg["content"])
+            user_html = f"""
+            <div class="chat-bubble-user">
+                <div class="chat-role">{'Vous' if language == 'fr' else 'You'}</div>
+                <div class="chat-content">{safe_text}</div>
+            </div>
+            """
+            st.markdown(user_html, unsafe_allow_html=True)
+
+        else:
+            safe_text = render_bubble_text(msg["content"])
+            bot_html = f"""
+            <div class="chat-bubble-bot">
+                <div class="chat-role">hormonAI</div>
+                <div class="chat-content">{safe_text}</div>
+            </div>
+            """
+            st.markdown(bot_html, unsafe_allow_html=True)
+
+            # ✅ Only show dropdown when we actually answered AND sources exist
+            if show_sources and msg.get("sources"):
+                exp_label = (
+                    "Sources de la FAQ utilisées pour cette réponse"
+                    if language == "fr"
+                    else "FAQ sources used for this answer"
+                )
+                with st.expander(exp_label):
+                    for i, src in enumerate(msg["sources"], start=1):
+                        st.markdown(
+                            f"**Source {i}** – score: <span class='score-pill'>{src['score']:.3f}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(f"- **Section:** {src['section']}")
+                        st.markdown(f"- **Question:** {src['question']}")
+                        snippet = src["answer"]
+                        if len(snippet) > 350:
+                            snippet = snippet[:350] + "…"
+                        st.markdown(f"- **Answer snippet:** {snippet}")
 
 # ---------- USER INPUT ----------
 st.markdown(f'<div class="prompt-label">{prompt_label}</div>', unsafe_allow_html=True)

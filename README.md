@@ -77,6 +77,7 @@ If `HybridFAQRetriever(rerank=True)` and CrossEncoder loads successfully:
 ## Create a virtual environment and install dependencies
 ```bash
 python3 -m venv ht_faq_rag
+
 source ht_faq_rag/bin/activate
 
 pip install -r requirements.txt
@@ -126,5 +127,6 @@ python chatbot.py -l en --use-llm
 ## Run the app (GUI)
 ```python
 streamlit run hormonai_app.py
+#python -m streamlit run hormonai_app.py 
 ```
 
