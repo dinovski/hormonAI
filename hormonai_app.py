@@ -22,7 +22,6 @@ DEFAULT_LLM_MODEL = os.getenv("HORMONAI_LLM_MODEL", "llama3.2")
 SAMPLE_PROMPTS = {
     "en": {
         "Side effects": [
-            "I'm on tamoxifen and I've had heartburn and joint pain for two weeks — is this normal or should I call my doctor?",
             "How do I tell the difference between a side effect I can wait out and one that needs urgent attention?",
         ],
         "Uterine/endometrial cancer risk": [
@@ -33,7 +32,6 @@ SAMPLE_PROMPTS = {
             "Is it ever okay to take a break from hormone therapy, or does that increase my risk?",
         ],
         "Mood, sleep, cognition": [
-            "My doctor says my insomnia and mood swings aren't from the medication — could they actually be related?",
             "What can I ask my care team about managing depression or brain fog while on this treatment?",
         ],
         "Digestive symptoms": [
@@ -58,11 +56,9 @@ SAMPLE_PROMPTS = {
     },
     "fr": {
         "Effets secondaires": [
-            "Je prends du tamoxifène et j'ai des brûlures d'estomac et des douleurs articulaires depuis deux semaines — est-ce normal ou dois-je appeler mon médecin ?",
             "Comment faire la différence entre un effet secondaire à surveiller et un effet qui nécessite une attention urgente ?",
         ],
         "Risque de cancer de l'utérus/de l'endomètre": [
-            "J'ai remarqué plus de pertes vaginales depuis que j'ai commencé le tamoxifène — est-ce que cela pourrait signifier un cancer de l'utérus ?",
             "Quels symptômes seraient réellement un signal d'alarme pour un cancer de l'utérus, par rapport à un simple effet secondaire du tamoxifène ?",
         ],
         "Commencer ou arrêter le traitement": [
@@ -70,7 +66,6 @@ SAMPLE_PROMPTS = {
             "Est-ce parfois acceptable de faire une pause dans l'hormonothérapie, ou cela augmente-t-il mon risque ?",
         ],
         "Humeur, sommeil, cognition": [
-            "Mon médecin dit que mon insomnie et mes sautes d'humeur ne sont pas liées au médicament — est-ce que cela pourrait quand même être lié ?",
             "Que puis-je demander à mon équipe soignante pour gérer la dépression ou le brouillard mental pendant ce traitement ?",
         ],
         "Symptômes digestifs": [
@@ -559,7 +554,7 @@ use_llm = st.sidebar.checkbox(
 
 use_rerank = st.sidebar.checkbox(
     use_rerank_label,
-    value=False,
+    value=True,
     help=use_rerank_help,
 )
 

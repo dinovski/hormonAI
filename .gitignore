@@ -1,5 +1,16 @@
-# Logs
+# Virtual environment (never commit — 42k+ files, this is what made `git add *` grind)
+ht_faq_rag/
+venv/
+.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Logs / audit output (but NOT the gold eval set at tests/eval_set.jsonl)
 logs/
 *.log
-*.jsonl
 
+# OS cruft
+.DS_Store

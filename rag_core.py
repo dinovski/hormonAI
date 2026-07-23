@@ -39,6 +39,40 @@ def _has_number_or_percent(text: str) -> bool:
     return bool(re.search(r"(\d+(\.\d+)?)\s*%|\b\d+(\.\d+)?\b", t))
 
 
+_INTERROGATIVE_PREFIX = re.compile(
+    r"^(can|do|does|is|are|should|shall|will|would|could|may|might|what|when|why|how|where|which|who|"
+    r"puis|dois|doit|est-ce|peut|peut-on|peut-il|faut|faut-il|comment|pourquoi|quand|quoi|quel|quelle|où|y-a-t-il)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_faq_question(question: str) -> bool:
+    """
+    Guard against parse artifacts where an ANSWER fragment was stored as a
+    question (e.g. "Do not double up to make up for a missed dose.",
+    "When osteoporosis exists before or develops during treatment, ...").
+
+    A well-formed FAQ question either ends with '?' or is a short
+    interrogative clause. Long declarative sentences that merely start with an
+    interrogative word ("When osteoporosis exists...") are rejected. This is a
+    runtime safety net for the prebuilt indexes; ingest_faq.py has been fixed
+    so freshly ingested corpora will not contain these artifacts.
+    """
+    q = (question or "").strip()
+    if not q:
+        return False
+    if q.endswith("?"):
+        return True
+    # Reject negative imperatives / instruction lines ("Do not double up ...",
+    # "Ne pas ...") that start with an interrogative-looking word but are answers.
+    if re.match(r"^(do not|don't|never|ne\s+pas|n[’']|il ne faut pas)\b", q, flags=re.IGNORECASE):
+        return False
+    # No question mark: only accept a short interrogative clause.
+    if _INTERROGATIVE_PREFIX.match(q) and len(_tokenize(q)) <= 12:
+        return True
+    return False
+
+
 # ---------------------------
 # Stopwords / keyword gating
 # ---------------------------
@@ -55,6 +89,16 @@ EN_STOPWORDS = {
     "what","why","how","when","where","which",
     "m","im","ive","id","ill","dont","cant","wont","youre","were","theyre","isnt","arent",
     "have","having",
+    # function words / discourse fillers that carry no retrievable concept.
+    # These previously survived as "anchors" and could never be matched in the
+    # corpus, forcing false abstentions (e.g. "ever" in the break/risk example).
+    "ever","never","always","really","actually","just","still","instead","anymore",
+    "sometimes","often","maybe","perhaps","also","too","much","many","more","most",
+    "even","yet","already","soon","later","now","thing","things","stuff","way","ways",
+    "okay","ok","please","thanks","thank","hello","hi","hey","yes","no","not",
+    "am","being","being","about","around","over","under","between",
+    "want","wanting","wanted","wonder","wondering","tell","told","ask","asking","know","knowing",
+    "mean","means","meant","like","kind","sort","bit","lot","lots",
 }
 
 FR_STOPWORDS = {
@@ -66,6 +110,13 @@ FR_STOPWORDS = {
     "quoi","pourquoi","comment","quand","où","ou","quel","quelle","quels","quelles",
     "j","t","c","d","l","n","qu",
     "ai","as","avons","avez","ont","avais","avait","aviez","avaient",
+    # French function words / fillers (mirror of the English additions).
+    "jamais","toujours","vraiment","juste","encore","plutôt","plutot","aussi","trop",
+    "beaucoup","plus","parfois","souvent","peut-être","peut","être","déjà","deja",
+    "maintenant","bientôt","bientot","chose","choses","truc","trucs","façon","facon",
+    "d'accord","daccord","merci","bonjour","salut","oui","non","pas","ne",
+    "vouloir","veux","veut","savoir","sais","sait","dire","dis","dit","demander",
+    "genre","sorte","peu",
 }
 
 GENERIC_EN = {
@@ -147,13 +198,51 @@ STATS_BROAD_CONCEPTS_EN = {"cancer", "patient", "patients", "people", "person", 
 STATS_BROAD_CONCEPTS_FR = {"cancer", "patient", "patients", "personne", "personnes", "sein"}
 
 
+# Words that, on their own, signal the user wants a statistic.
+# NOTE: bare "how"/"many"/"often" are deliberately EXCLUDED -- they caused
+# duration questions like "How long do I need to stay on therapy?" to be
+# misrouted into the strict stats gate and hard-abstained. Statistical INTENT
+# is now detected from explicit statistical words or specific bigrams.
+STATS_WORD_EN = {
+    "percent", "percentage", "proportion", "rate", "rates",
+    "prevalence", "incidence", "odds", "probability", "likelihood", "frequency",
+}
+STATS_WORD_FR = {
+    "pourcentage", "percent", "proportion", "taux", "prévalence", "prevalence",
+    "incidence", "probabilité", "probabilite", "fréquence", "frequence",
+}
+
+_STATS_BIGRAMS_EN = {
+    ("how", "many"), ("how", "often"), ("how", "likely"),
+    ("what", "percentage"), ("what", "percent"), ("what", "proportion"),
+    ("what", "fraction"), ("what", "share"),
+}
+
+
 def _is_stats_intent(user_query: str, language: str) -> bool:
     lang = _norm_lang(language)
-    toks = set(_tokenize(user_query))
-    hints = STATS_INTENT_HINTS_FR if lang == "fr" else STATS_INTENT_HINTS_EN
-    if "%" in (user_query or ""):
+    text = user_query or ""
+    if "%" in text:
         return True
-    return len(toks.intersection(hints)) > 0
+
+    toks = _tokenize(text)          # ordered
+    tokset = set(toks)
+    words = STATS_WORD_FR if lang == "fr" else STATS_WORD_EN
+    if tokset & words:
+        return True
+
+    bigrams = set(zip(toks, toks[1:]))
+    if lang == "fr":
+        # "combien de <X>" is statistical, EXCEPT "combien de temps" (= how long).
+        if ("combien", "de") in bigrams and "temps" not in tokset:
+            return True
+        if ("quelle", "fréquence") in bigrams or ("quelle", "frequence") in bigrams:
+            return True
+        if ("quel", "pourcentage") in bigrams:
+            return True
+        return False
+
+    return len(bigrams & _STATS_BIGRAMS_EN) > 0
 
 
 # ---------------------------
@@ -227,23 +316,73 @@ def _emotion_stems(language: str) -> Set[str]:
 # Lay ↔ clinical synonym sets (MATCHING ONLY)
 # ---------------------------
 
+# Lay <-> clinical synonym groups. Any member of a group is considered to
+# cover any other member during the coverage gate. This is a stopgap that
+# encodes the most common lay/clinical mismatches; the durable fix is a
+# domain-adapted embedding model or an LLM query-rewrite step (see
+# RETRIEVAL_REVIEW.md, section 5.3).
+_SYNONYM_GROUPS_EN: List[List[str]] = [
+    ["heart", "cardiovascular", "cardio", "cardiac"],
+    ["bone", "bones", "osteoporosis", "osteoporotic", "skeletal"],
+    # "break" was the concept that broke the example query: the corpus phrases
+    # the same idea as "pause", "stop", "discontinue", etc.
+    ["break", "pause", "stop", "stopping", "interrupt", "interruption",
+     "discontinue", "discontinuation", "hold", "holiday", "suspend"],
+    ["pregnant", "pregnancy", "conceive", "conception", "fertility", "baby", "child"],
+    ["tired", "tiredness", "fatigue", "exhausted", "exhaustion", "energy"],
+    ["period", "periods", "menstrual", "menstruation", "cycle", "cycles", "bleeding"],
+    ["bloodwork", "blood", "bloodtest", "labs"],
+    ["mood", "depression", "depressed", "sad"],
+    ["sleep", "sleeping", "insomnia"],
+    ["libido", "sex", "sexual", "desire"],
+    ["diet", "food", "foods", "eat", "eating", "nutrition"],
+    ["exercise", "activity", "sport", "sports", "physical"],
+    ["recurrence", "relapse", "return", "coming-back", "comeback"],
+]
+
+_SYNONYM_GROUPS_FR: List[List[str]] = [
+    ["coeur", "cardiovasculaire", "cardio", "cardiaque"],
+    ["os", "osseux", "ostéoporose", "osteoporose", "squelette"],
+    ["pause", "arrêt", "arret", "arrêter", "arreter", "stopper", "interrompre",
+     "interruption", "suspendre", "interrompue"],
+    ["enceinte", "grossesse", "concevoir", "conception", "fertilité", "fertilite",
+     "bébé", "bebe", "enfant"],
+    ["fatigue", "fatigué", "fatigue", "épuisé", "epuise", "épuisement", "énergie", "energie"],
+    ["règles", "regles", "menstruel", "menstruation", "cycle", "cycles", "saignement"],
+    ["sang", "prise-de-sang", "analyses"],
+    ["humeur", "dépression", "depression", "déprimé", "deprime", "triste"],
+    ["sommeil", "dormir", "insomnie"],
+    ["libido", "sexe", "sexuel", "sexuelle", "désir", "desir"],
+    ["régime", "regime", "alimentation", "aliment", "aliments", "manger", "nutrition"],
+    ["exercice", "activité", "activite", "sport", "physique"],
+    ["récidive", "recidive", "rechute", "retour"],
+]
+
+
+def _build_synonym_map(groups: List[List[str]], lang: str) -> Dict[str, Set[str]]:
+    m: Dict[str, Set[str]] = {}
+    for group in groups:
+        stems = {_stem(w, lang) for w in group}
+        for s in stems:
+            m.setdefault(s, set()).update(stems)
+    return m
+
+
+_SYNONYM_MAP_CACHE: Dict[str, Dict[str, Set[str]]] = {}
+
+
+def _synonym_map(lang: str) -> Dict[str, Set[str]]:
+    lang = _norm_lang(lang)
+    if lang not in _SYNONYM_MAP_CACHE:
+        groups = _SYNONYM_GROUPS_FR if lang == "fr" else _SYNONYM_GROUPS_EN
+        _SYNONYM_MAP_CACHE[lang] = _build_synonym_map(groups, lang)
+    return _SYNONYM_MAP_CACHE[lang]
+
+
 def _concept_match_stems(concept_stem: str, language: str) -> Set[str]:
     lang = _norm_lang(language)
-
-    if lang == "en":
-        m = {
-            _stem("heart", "en"): {_stem("heart", "en"), _stem("cardiovascular", "en"), _stem("cardio", "en")},
-            _stem("cardiovascular", "en"): {_stem("cardiovascular", "en"), _stem("heart", "en"), _stem("cardio", "en")},
-            _stem("bone", "en"): {_stem("bone", "en"), _stem("osteoporosis", "en"), _stem("osteoporotic", "en")},
-        }
-        return m.get(concept_stem, {concept_stem})
-
-    m_fr = {
-        _stem("coeur", "fr"): {_stem("coeur", "fr"), _stem("cardiovasculaire", "fr"), _stem("cardio", "fr")},
-        _stem("cardiovasculaire", "fr"): {_stem("cardiovasculaire", "fr"), _stem("coeur", "fr"), _stem("cardio", "fr")},
-        _stem("os", "fr"): {_stem("os", "fr"), _stem("ostéoporose", "fr"), _stem("osteoporose", "fr")},
-    }
-    return m_fr.get(concept_stem, {concept_stem})
+    m = _synonym_map(lang)
+    return m.get(concept_stem, {concept_stem})
 
 
 def _anchor_overlap_concepts(text: str, anchor_concepts: Set[str], language: str) -> Set[str]:
@@ -317,6 +456,10 @@ class RetrievalCandidate:
     answer: str
     fused_score: float
     rerank_score: Optional[float] = None
+    # Best cosine similarity to the query across the dense (FAISS) indexes.
+    # Used by the semantic-accept path so the answer/abstain decision is not
+    # purely lexical. None when no dense index returned this candidate.
+    dense_sim: Optional[float] = None
 
 
 @dataclass
@@ -361,6 +504,10 @@ class HybridFAQRetriever:
 
         self._stored_embedding_model_name: Optional[str] = None
 
+        # Set of every stem that appears anywhere in the corpus. Used to prune
+        # anchor concepts that can never be covered (junk/out-of-vocab tokens).
+        self._corpus_stems: Set[str] = set()
+
     def load(self) -> None:
         prefix = f"faq_{self.language}"
         qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
@@ -373,6 +520,15 @@ class HybridFAQRetriever:
             payload = pickle.load(f)
         self._items = payload["items"]
         self._stored_embedding_model_name = payload.get("embedding_model_name")
+
+        # Precompute the set of corpus stems (question + section + answer, plus
+        # any stored paraphrases) for anchor-concept pruning.
+        self._corpus_stems = set()
+        for it in self._items:
+            blob = f"{it.get('question','')} {it.get('section','')} {it.get('answer','')}"
+            for para in (it.get("q_paraphrases") or []):
+                blob += " " + str(para)
+            self._corpus_stems |= _stem_set(_tokenize(blob), self.language)
 
         with open(bm25_path, "rb") as f:
             payload_bm25 = pickle.load(f)
@@ -424,6 +580,13 @@ class HybridFAQRetriever:
         faiss.normalize_L2(emb)
         return emb
 
+    def stem_in_corpus(self, stem: str) -> bool:
+        """True if the given stem (or any of its synonyms) appears in the corpus."""
+        if not self._corpus_stems:
+            return True  # corpus stems unavailable: do not prune
+        acceptable = _concept_match_stems(stem, self.language)
+        return len(self._corpus_stems.intersection(acceptable)) > 0
+
     def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
         if not self._items:
             return []
@@ -435,24 +598,39 @@ class HybridFAQRetriever:
         bm25_scores = self._bm25.get_scores(_tokenize(user_query))
         bm25_ranked = np.argsort(-bm25_scores)[: self.top_k]
 
+        # The three dense indexes are queried with the same encoded vector; only
+        # the document side differs, so encode once (was encoded three times).
         q_emb = self._encode(f"Question: {user_query}")
-        _, Iq = self._index_q.search(q_emb, self.top_k)
-
-        qa_emb = self._encode(f"Question: {user_query}")
-        _, Iqa = self._index_qa.search(qa_emb, self.top_k)
+        Dq, Iq = self._index_q.search(q_emb, self.top_k)
+        Dqa, Iqa = self._index_qa.search(q_emb, self.top_k)
 
         Iqp = None
+        Dqp = None
         if self._index_qp is not None:
             try:
-                qp_emb = self._encode(f"Question: {user_query}")
-                _, Iqp = self._index_qp.search(qp_emb, self.top_k)
+                Dqp, Iqp = self._index_qp.search(q_emb, self.top_k)
             except Exception:
                 Iqp = None
+                Dqp = None
 
         def rrf(rank: int, k: int = 60) -> float:
             return 1.0 / (k + rank)
 
         fused: Dict[int, float] = {}
+        # Track the best cosine similarity seen for each item across dense indexes
+        # (IndexFlatIP on L2-normalized vectors -> inner product == cosine).
+        dense_sim: Dict[int, float] = {}
+
+        def _note_dense(D, I):
+            if D is None or I is None:
+                return
+            for sim, idx in zip(D[0].tolist(), I[0].tolist()):
+                if idx >= 0:
+                    dense_sim[int(idx)] = max(dense_sim.get(int(idx), -1.0), float(sim))
+
+        _note_dense(Dq, Iq)
+        _note_dense(Dqa, Iqa)
+        _note_dense(Dqp, Iqp)
 
         for r, idx in enumerate(bm25_ranked.tolist()):
             fused[int(idx)] = fused.get(int(idx), 0.0) + rrf(r)
@@ -472,13 +650,19 @@ class HybridFAQRetriever:
         candidates: List[RetrievalCandidate] = []
         for idx, score in ranked:
             it = self._items[int(idx)]
+            question = str(it.get("question", ""))
+            # Runtime artifact filter: drop answer-fragments mis-parsed as
+            # questions in the prebuilt indexes (see _looks_like_faq_question).
+            if not _looks_like_faq_question(question):
+                continue
             candidates.append(
                 RetrievalCandidate(
                     index=int(idx),
-                    question=str(it.get("question", "")),
+                    question=question,
                     section=str(it.get("section", "")),
                     answer=str(it.get("answer", "")),
                     fused_score=float(score),
+                    dense_sim=(dense_sim.get(int(idx)) if int(idx) in dense_sim else None),
                 )
             )
 
@@ -677,7 +861,19 @@ def _select_bundle_with_coverage(
     language: str,
     anchor_concepts: Set[str],
     max_n: int = 3,
+    min_member_sim: Optional[float] = None,
 ) -> Tuple[List[RetrievalCandidate], Dict[str, Any]]:
+    """
+    Greedily build a bundle that covers as many anchor concepts as possible.
+
+    The FIRST (lead) member is always the highest-scoring candidate that covers
+    anything. SECONDARY members must also be independently relevant: if
+    `min_member_sim` is set, a secondary candidate is only added when its dense
+    similarity clears that bar. This prevents a strong lead answer from being
+    padded with low-relevance entries that happen to share a weak keyword
+    (e.g. "long flights" / "stay hydrated" for a "how long do I stay on it?"
+    question).
+    """
     lang = _norm_lang(language)
     ranked = sorted(candidates, key=_score_candidate, reverse=True)
 
@@ -696,6 +892,11 @@ def _select_bundle_with_coverage(
             continue
         if cov.issubset(covered):
             continue
+
+        # Quality bar for secondary members (the lead is always allowed).
+        if bundle and min_member_sim is not None:
+            if c.dense_sim is not None and c.dense_sim < min_member_sim:
+                continue
 
         bundle.append(c)
         covered |= cov
@@ -756,13 +957,38 @@ def _stats_concept_stems_to_require(anchor_concepts: Set[str], language: str) ->
 # Main answer function
 # ---------------------------
 
+def _semantic_top(candidates: List[RetrievalCandidate]) -> Optional[RetrievalCandidate]:
+    """Candidate with the highest dense cosine similarity to the query."""
+    scored = [c for c in candidates if c.dense_sim is not None]
+    if not scored:
+        return None
+    return max(scored, key=lambda c: c.dense_sim if c.dense_sim is not None else -1.0)
+
+
 def answer_query(
     retriever: "HybridFAQRetriever",
     user_query: str,
     use_llm: bool = False,
     llm_model: str = "llama3.2",
     debug: bool = False,
+    sem_accept_threshold: float = 0.62,
+    coverage_fraction: float = 0.5,
 ) -> AnswerResult:
+    """
+    Answer/abstain decision.
+
+    Two independent accept paths (either one answers):
+      1. Coverage floor: the candidate bundle lexically covers at least
+         ceil(coverage_fraction * N) of the in-corpus anchor concepts
+         (N = number of anchor concepts that actually appear in the corpus).
+         This replaces the old all-concepts AND gate.
+      2. Semantic accept: the top dense-retrieval candidate is at least
+         `sem_accept_threshold` cosine-similar to the query, regardless of
+         lexical overlap. This rescues lay/clinical wording mismatches.
+
+    Both thresholds MUST be calibrated on the gold eval set
+    (tests/eval_set.jsonl) for the deployed embedding model.
+    """
     lang = retriever.language
     candidates = retriever.retrieve(user_query)
 
@@ -770,30 +996,52 @@ def answer_query(
     anchors = anchor_keywords(core_kws, lang)
     anchor_concepts = _stem_set(anchors, lang)
 
+    # Prune anchor concepts that cannot possibly be covered because neither the
+    # concept nor any synonym appears in the corpus (e.g. "ever"). These were
+    # the direct cause of false abstentions under the old AND gate.
+    present_concepts = {c for c in anchor_concepts if retriever.stem_in_corpus(c)}
+    absent_concepts = anchor_concepts - present_concepts
+
     stats_intent = _is_stats_intent(user_query, lang)
+    sem_top = _semantic_top(candidates)
+    sem_top_sim = (sem_top.dense_sim if (sem_top and sem_top.dense_sim is not None) else None)
 
     dbg: Dict[str, Any] = {}
     if debug:
         dbg["core_kws"] = core_kws
         dbg["anchors"] = anchors
         dbg["anchor_stems"] = sorted(list(anchor_concepts))[:40]
+        dbg["present_concepts"] = sorted(list(present_concepts))[:40]
+        dbg["absent_concepts"] = sorted(list(absent_concepts))[:40]
         dbg["stats_intent"] = stats_intent
+        dbg["sem_top_sim"] = (round(sem_top_sim, 4) if sem_top_sim is not None else None)
+        dbg["sem_accept_threshold"] = sem_accept_threshold
         dbg["qp_index_loaded"] = (retriever._index_qp is not None)  # type: ignore[attr-defined]
         dbg["top_candidates"] = [
             {"idx": c.index, "fused": round(c.fused_score, 5),
              "rerank": (round(c.rerank_score, 3) if c.rerank_score is not None else None),
+             "dense": (round(c.dense_sim, 4) if c.dense_sim is not None else None),
              "q": c.question[:140], "section": c.section[:140]}
             for c in candidates[:10]
         ]
 
-    if len(core_kws) < 1 or len(anchors) < 1 or not candidates:
+    # Only hard-abstain when there is nothing to work with at all. A query made
+    # up solely of drug/treatment terms (empty anchors) is NOT abstained here;
+    # it falls through to the semantic path below.
+    if len(core_kws) < 1 or not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
+    bundle: Optional[List[RetrievalCandidate]] = None
+
     # -----------------------
-    # Stats questions: strict guard
+    # Stats questions: prefer a grounded statistic when the user asked for one.
+    # If no grounded statistic is found we do NOT hard-abstain: we fall through
+    # to the general path, which can still answer qualitatively from the FAQ
+    # (still quoting the FAQ, never fabricating numbers).
     # -----------------------
     if stats_intent:
-        required_concepts = _stats_concept_stems_to_require(anchor_concepts, lang)
+        # Only require concepts that actually appear in the corpus.
+        required_concepts = _stats_concept_stems_to_require(present_concepts, lang)
 
         if debug:
             dbg["stats_required_concepts"] = sorted(list(required_concepts))[:20]
@@ -817,28 +1065,61 @@ def answer_query(
         if debug:
             dbg["stats_gate_candidates"] = [{"idx": c.index, "q": c.question[:120]} for c in ok_stats_candidates[:10]]
 
-        if not ok_stats_candidates:
-            return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
-
-        best = sorted(ok_stats_candidates, key=_score_candidate, reverse=True)[0]
-        bundle = [best]
-
-    else:
-        # -----------------------
-        # Non-stats: multi-anchor coverage when needed
-        # -----------------------
-        if len(anchor_concepts) >= 2:
-            bundle, cov_details = _select_bundle_with_coverage(candidates, lang, anchor_concepts, max_n=3)
+        if ok_stats_candidates:
+            best = sorted(ok_stats_candidates, key=_score_candidate, reverse=True)[0]
+            bundle = [best]
             if debug:
-                dbg["coverage_gate"] = cov_details
-            if not cov_details["coverage_complete"]:
+                dbg["decision_path"] = "stats"
+        elif debug:
+            # No grounded statistic; general path takes over below.
+            dbg["stats_fell_through"] = True
+
+    if bundle is None:
+        # -----------------------
+        # General path: coverage floor OR semantic accept
+        # (also handles stats queries that found no grounded statistic)
+        # -----------------------
+        import math
+
+        semantic_ok = (sem_top_sim is not None) and (sem_top_sim >= sem_accept_threshold)
+
+        if not present_concepts:
+            # Nothing lexically anchorable (e.g. drug-only query, or all anchors
+            # are out-of-vocab). Rely entirely on the semantic signal.
+            if debug:
+                dbg["decision_path"] = "semantic_only"
+            if semantic_ok and sem_top is not None:
+                bundle = [sem_top]
+            else:
                 return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
         else:
-            bundle, cov_details = _select_bundle_with_coverage(candidates, lang, anchor_concepts, max_n=1)
+            n_present = len(present_concepts)
+            required = max(1, math.ceil(coverage_fraction * n_present))
+            bundle, cov_details = _select_bundle_with_coverage(
+                candidates, lang, present_concepts, max_n=3,
+                min_member_sim=sem_accept_threshold,
+            )
+            covered_n = len(cov_details["covered_concepts"])
+            coverage_ok = covered_n >= required
+            cov_details["required_cover_count"] = required
+            cov_details["covered_cover_count"] = covered_n
+            cov_details["coverage_ok"] = coverage_ok
             if debug:
                 dbg["coverage_gate"] = cov_details
-            if not cov_details["coverage_complete"]:
-                return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+                dbg["decision_path"] = "coverage_floor+semantic"
+
+            if not coverage_ok:
+                # Coverage floor missed. Rescue with a strong semantic match.
+                if semantic_ok and sem_top is not None:
+                    if sem_top not in bundle:
+                        bundle = [sem_top] + bundle
+                    if debug:
+                        dbg["decision_path"] = "semantic_rescue"
+                else:
+                    return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+        if not bundle:
+            return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
     # Build FAQ answer
     faq_body = _format_bundle_body(lang, bundle)
@@ -878,7 +1159,12 @@ def print_debug(result: AnswerResult) -> None:
     print("\n[DEBUG] core_kws:", result.debug.get("core_kws"))
     print("[DEBUG] anchors:", result.debug.get("anchors"))
     print("[DEBUG] anchor_stems:", result.debug.get("anchor_stems"))
+    print("[DEBUG] present_concepts:", result.debug.get("present_concepts"))
+    print("[DEBUG] absent_concepts:", result.debug.get("absent_concepts"))
     print("[DEBUG] stats_intent:", result.debug.get("stats_intent"))
+    print("[DEBUG] sem_top_sim:", result.debug.get("sem_top_sim"),
+          "(threshold:", str(result.debug.get("sem_accept_threshold")) + ")")
+    print("[DEBUG] decision_path:", result.debug.get("decision_path"))
     print("[DEBUG] qp_index_loaded:", result.debug.get("qp_index_loaded"))
 
     if "stats_required_concepts" in result.debug:
@@ -892,4 +1178,5 @@ def print_debug(result: AnswerResult) -> None:
 
     print("[DEBUG] Retrieved candidates:")
     for row in result.debug.get("top_candidates", []):
-        print(f"  idx={row['idx']} fused={row['fused']} rerank={row['rerank']} | Q={row['q']}")
+        print(f"  idx={row['idx']} fused={row['fused']} rerank={row['rerank']} "
+              f"dense={row.get('dense')} | Q={row['q']}")

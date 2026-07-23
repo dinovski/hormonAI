@@ -109,6 +109,11 @@ faq_<lang>_qa.pkl             # Parsed FAQ items + metadata
 faq_<lang>_bm25.pkl           # BM25 index
 ```
 
+## Test Retreival
+```python
+python tests/eval_retrieval.py --verbose
+```
+
 ## Run hormonAI (CLI)
 ```python
 python chatbot.py -l en [--debug]

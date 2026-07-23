@@ -84,10 +84,23 @@ def looks_like_question_sentence(text: str) -> bool:
         return False
     if t.endswith("?"):
         return True
-    # Sometimes questions are written without ?, so use soft heuristics
-    if re.match(r"^(can|do|does|is|are|should|what|when|why|how)\b", t, flags=re.IGNORECASE):
+    # No question mark: only treat as a question if it is a SHORT interrogative
+    # clause. Long declarative sentences that merely start with an interrogative
+    # word ("When osteoporosis exists before or develops during treatment, ...")
+    # or imperative answer lines ("Do not double up ...") are NOT questions.
+    # Requiring brevity here prevents answer fragments from being ingested as
+    # standalone Q/A entries (previously produced artifacts at EN idx 7 & 27).
+    word_count = len(re.findall(r"\b\w+\b", t))
+    if word_count > 12:
+        return False
+    # Reject negative imperatives like "Do not ...", "Ne pas ..."
+    if re.match(r"^(do not|don't|never|ne\s+pas|n[’']|il ne faut pas)\b", t, flags=re.IGNORECASE):
+        return False
+    if re.match(r"^(can|do|does|is|are|should|shall|will|would|could|may|might|"
+                r"what|when|why|how|where|which|who)\b", t, flags=re.IGNORECASE):
         return True
-    if re.match(r"^(puis|dois|est-ce|comment|pourquoi|quand|quoi)\b", t, flags=re.IGNORECASE):
+    if re.match(r"^(puis|dois|doit|est-ce|peut|peut-on|faut|faut-il|comment|"
+                r"pourquoi|quand|quoi|quel|quelle|où)\b", t, flags=re.IGNORECASE):
         return True
     return False
 

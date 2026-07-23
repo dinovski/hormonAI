@@ -25,8 +25,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-k", type=int, default=12)
     p.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
 
-    p.add_argument("--rerank", action="store_true", help="Enable CrossEncoder reranking (better, slower).")
+    # Reranking is ON by default: it reorders candidates so the coverage/stats
+    # gates operate on better-ordered results. Use --no-rerank to disable.
+    # The cross-encoder loads lazily and degrades gracefully if unavailable.
+    p.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True,
+                   help="CrossEncoder reranking (better ordering, slower). Default: on. Disable with --no-rerank.")
     p.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+
+    # Gate tuning (calibrate on tests/eval_set.jsonl for the deployed model).
+    p.add_argument("--sem-threshold", type=float, default=0.62,
+                   help="Cosine-similarity floor for the semantic-accept path (default: 0.62).")
+    p.add_argument("--coverage-fraction", type=float, default=0.5,
+                   help="Fraction of in-corpus anchor concepts a bundle must cover (default: 0.5).")
 
     p.add_argument("--use-llm", action="store_true", help="Add an empathetic tone wrapper with an LLM (ONLY for answered queries).")
     p.add_argument("--llm-model", default="llama3.2", help="Ollama model name (default: llama3.2).")
@@ -79,6 +89,8 @@ def main() -> None:
             use_llm=args.use_llm,
             llm_model=args.llm_model,
             debug=args.debug,
+            sem_accept_threshold=args.sem_threshold,
+            coverage_fraction=args.coverage_fraction,
         )
 
         if args.debug:
