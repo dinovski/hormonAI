@@ -66,8 +66,12 @@ def main() -> int:
     ap.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
     ap.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
-    ap.add_argument("--sem-threshold", type=float, default=0.62)
-    ap.add_argument("--coverage-fraction", type=float, default=0.5)
+    ap.add_argument("--sem-threshold", type=float, default=0.62,
+                    help="Dense cosine accept threshold (reranking OFF).")
+    ap.add_argument("--rerank-threshold", type=float, default=0.0,
+                    help="Cross-encoder accept threshold (reranking ON).")
+    ap.add_argument("--dense-floor", type=float, default=0.50,
+                    help="Cosine floor for the high-IDF lexical safety net.")
     ap.add_argument("--include-hard", action="store_true", help="Count 'hard' cases in the headline totals.")
     ap.add_argument("--verbose", action="store_true", help="Print every case result.")
     ap.add_argument("--json", default=None, help="Write full per-case results to this JSON file.")
@@ -105,7 +109,8 @@ def main() -> int:
             use_llm=False,
             debug=True,
             sem_accept_threshold=args.sem_threshold,
-            coverage_fraction=args.coverage_fraction,
+            rerank_accept_threshold=args.rerank_threshold,
+            dense_floor=args.dense_floor,
         )
 
         recall_hit = bool(gold & set(retrieved_idx)) if gold else None

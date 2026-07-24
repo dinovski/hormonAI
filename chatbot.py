@@ -32,11 +32,14 @@ def parse_args() -> argparse.Namespace:
                    help="CrossEncoder reranking (better ordering, slower). Default: on. Disable with --no-rerank.")
     p.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 
-    # Gate tuning (calibrate on tests/eval_set.jsonl for the deployed model).
+    # Gate tuning (calibrate on tests/eval_set.jsonl for the deployed models).
+    # Semantic-first: rerank score is primary when --rerank is on, else dense cosine.
     p.add_argument("--sem-threshold", type=float, default=0.62,
-                   help="Cosine-similarity floor for the semantic-accept path (default: 0.62).")
-    p.add_argument("--coverage-fraction", type=float, default=0.5,
-                   help="Fraction of in-corpus anchor concepts a bundle must cover (default: 0.5).")
+                   help="Dense cosine accept threshold when reranking is OFF (default: 0.62).")
+    p.add_argument("--rerank-threshold", type=float, default=0.0,
+                   help="Cross-encoder accept threshold when reranking is ON (default: 0.0).")
+    p.add_argument("--dense-floor", type=float, default=0.50,
+                   help="Permissive cosine floor for the high-IDF lexical safety net (default: 0.50).")
 
     p.add_argument("--use-llm", action="store_true", help="Add an empathetic tone wrapper with an LLM (ONLY for answered queries).")
     p.add_argument("--llm-model", default="llama3.2", help="Ollama model name (default: llama3.2).")
@@ -90,7 +93,8 @@ def main() -> None:
             llm_model=args.llm_model,
             debug=args.debug,
             sem_accept_threshold=args.sem_threshold,
-            coverage_fraction=args.coverage_fraction,
+            rerank_accept_threshold=args.rerank_threshold,
+            dense_floor=args.dense_floor,
         )
 
         if args.debug:

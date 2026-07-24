@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import re
 import json
+import math
 import pickle
 import hashlib
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -445,6 +447,112 @@ def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
 
 
 # ---------------------------
+# IDF-weighted anchor extraction (replaces the stopword/generic/emotion lists)
+# ---------------------------
+
+# Minimal, DOMAIN-INDEPENDENT grammatical stop set. This is NOT the old
+# maintained keyword machinery -- it only removes universal function words that
+# have no retrieval value in any corpus. Everything domain-specific (which
+# medical terms are "generic", which words are emotional, which are drugs) is
+# now handled automatically by corpus IDF, so those lists are no longer used
+# for extraction.
+_MINIMAL_FUNCTION_WORDS = {
+    # English
+    "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "for",
+    "with", "as", "at", "by", "from", "is", "are", "was", "were", "be", "been",
+    "do", "does", "did", "have", "has", "had", "can", "could", "should", "would",
+    "will", "may", "might", "must", "i", "you", "we", "they", "he", "she", "it",
+    "my", "your", "our", "their", "this", "that", "these", "those", "what",
+    "why", "how", "when", "where", "which", "who", "not", "no", "yes",
+    "about", "into", "onto", "over", "under", "than", "then", "because",
+    "while", "during", "before", "after", "between", "through", "without",
+    "within", "again", "also", "too", "very", "just", "really", "ever",
+    "never", "always", "still", "instead", "sometimes", "maybe", "perhaps",
+    # discourse markers / interjections (closed-class, no retrieval value)
+    "okay", "ok", "please", "thanks", "thank", "hello", "hi", "hey", "yeah", "sure",
+    # French
+    "le", "la", "les", "un", "une", "des", "et", "ou", "de", "du", "dans", "sur",
+    "pour", "avec", "par", "au", "aux", "en", "est", "sont", "ai", "as", "avez",
+    "je", "tu", "il", "elle", "nous", "vous", "ils", "elles", "ce", "cet",
+    "cette", "ces", "quoi", "pourquoi", "comment", "quand", "quel", "quelle",
+    "pas", "ne", "que", "qui", "sans", "avant", "apres", "après", "encore",
+    "aussi", "vraiment", "juste", "jamais", "toujours", "parfois", "peut-etre",
+    "peut-être", "bonjour", "salut", "merci", "oui", "non",
+}
+
+
+@dataclass
+class AnchorExtraction:
+    anchors: List[str]                 # discriminative stems used for coverage
+    present: List[Tuple[str, float, int]]   # (stem, idf, df) for all in-corpus tokens
+    dropped_absent: List[str]          # tokens not in the corpus (df == 0)
+    dropped_common: List[str]          # in-corpus but too frequent to be useful
+
+
+def extract_anchor_concepts(
+    user_query: str,
+    language: str,
+    retriever: "HybridFAQRetriever",
+    max_df_fraction: float = 0.5,
+) -> AnchorExtraction:
+    """
+    Select anchor concepts by corpus IDF instead of hand-maintained lists.
+
+    A stem is an anchor iff it is:
+      - not a universal grammatical function word,
+      - present in the corpus (df >= 1), and
+      - discriminative, i.e. df <= max_df_fraction * corpus_size
+        (words appearing in more than ~half the corpus carry no signal).
+
+    Absent tokens (df == 0) are NOT anchors -- lexical matching cannot use them,
+    and they are handled by the semantic path. This automatically drops filler
+    ("ever", "really"), domain-generic terms ("hormone", "treatment"), emotion
+    words, and drug names that saturate the corpus, with zero curation.
+    """
+    lang = _norm_lang(language)
+    cap = max(1, int(retriever._corpus_size * max_df_fraction))
+
+    seen: Set[str] = set()
+    present: List[Tuple[str, float, int]] = []
+    dropped_absent: List[str] = []
+    anchors: List[str] = []
+    dropped_common: List[str] = []
+
+    for tok in _tokenize(user_query):
+        if len(tok) <= 2 or tok in _MINIMAL_FUNCTION_WORDS:
+            continue
+        s = _stem(tok, lang)
+        if s in seen:
+            continue
+        seen.add(s)
+
+        d = retriever.df(s)
+        if d <= 0:
+            dropped_absent.append(tok)
+            continue
+
+        present.append((s, retriever.idf(s), d))
+        if d <= cap:
+            anchors.append(s)
+        else:
+            dropped_common.append(tok)
+
+    # If everything present was too common (e.g. a very short, generic query),
+    # keep the single most specific (highest-IDF) present stem so lexical
+    # coverage still has something to work with.
+    if not anchors and present:
+        best = max(present, key=lambda x: x[1])
+        anchors.append(best[0])
+
+    return AnchorExtraction(
+        anchors=anchors,
+        present=present,
+        dropped_absent=dropped_absent,
+        dropped_common=dropped_common,
+    )
+
+
+# ---------------------------
 # Dataclasses
 # ---------------------------
 
@@ -508,6 +616,13 @@ class HybridFAQRetriever:
         # anchor concepts that can never be covered (junk/out-of-vocab tokens).
         self._corpus_stems: Set[str] = set()
 
+        # Corpus statistics for IDF-weighted anchor extraction (replaces the
+        # hand-maintained stopword / generic / emotion word lists).
+        self._corpus_size: int = 0
+        self._stem_df: Dict[str, int] = {}     # document frequency per stem
+        self._stem_idf: Dict[str, float] = {}  # smoothed inverse doc frequency
+        self._average_idf: float = 0.0
+
     def load(self) -> None:
         prefix = f"faq_{self.language}"
         qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
@@ -521,14 +636,32 @@ class HybridFAQRetriever:
         self._items = payload["items"]
         self._stored_embedding_model_name = payload.get("embedding_model_name")
 
-        # Precompute the set of corpus stems (question + section + answer, plus
-        # any stored paraphrases) for anchor-concept pruning.
-        self._corpus_stems = set()
+        # Precompute per-stem document frequency and smoothed IDF over the
+        # corpus (question + section + answer + any stored paraphrases). This
+        # drives IDF-weighted anchor extraction: common words (high df, e.g.
+        # "hormone", "take") get low weight automatically, so no stopword or
+        # domain "generic" list needs to be maintained. Absent words get df=0.
+        df: "Counter[str]" = Counter()
         for it in self._items:
             blob = f"{it.get('question','')} {it.get('section','')} {it.get('answer','')}"
             for para in (it.get("q_paraphrases") or []):
                 blob += " " + str(para)
-            self._corpus_stems |= _stem_set(_tokenize(blob), self.language)
+            # count each stem once per document
+            for s in _stem_set(_tokenize(blob), self.language):
+                df[s] += 1
+
+        self._corpus_size = max(1, len(self._items))
+        self._stem_df = dict(df)
+        # Smoothed IDF, always positive: log((N+1)/(df+1)) + 1
+        self._stem_idf = {
+            s: math.log((self._corpus_size + 1) / (c + 1)) + 1.0
+            for s, c in self._stem_df.items()
+        }
+        self._average_idf = (
+            sum(self._stem_idf.values()) / len(self._stem_idf)
+            if self._stem_idf else 0.0
+        )
+        self._corpus_stems = set(self._stem_df.keys())
 
         with open(bm25_path, "rb") as f:
             payload_bm25 = pickle.load(f)
@@ -586,6 +719,21 @@ class HybridFAQRetriever:
             return True  # corpus stems unavailable: do not prune
         acceptable = _concept_match_stems(stem, self.language)
         return len(self._corpus_stems.intersection(acceptable)) > 0
+
+    def df(self, stem: str) -> int:
+        """Document frequency of a stem (max over its synonym group)."""
+        acceptable = _concept_match_stems(stem, self.language)
+        return max((self._stem_df.get(a, 0) for a in acceptable), default=0)
+
+    def idf(self, stem: str) -> float:
+        """Smoothed IDF of a stem (min over its synonym group; 0.0 if absent)."""
+        acceptable = _concept_match_stems(stem, self.language)
+        vals = [self._stem_idf[a] for a in acceptable if a in self._stem_idf]
+        return min(vals) if vals else 0.0
+
+    @property
+    def average_idf(self) -> float:
+        return self._average_idf
 
     def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
         if not self._items:
@@ -965,6 +1113,16 @@ def _semantic_top(candidates: List[RetrievalCandidate]) -> Optional[RetrievalCan
     return max(scored, key=lambda c: c.dense_sim if c.dense_sim is not None else -1.0)
 
 
+def _primary_relevance(c: RetrievalCandidate, uses_rerank: bool) -> Optional[float]:
+    """The relevance signal used for the accept decision: cross-encoder rerank
+    score when reranking is active, otherwise dense cosine similarity."""
+    if uses_rerank and c.rerank_score is not None:
+        return float(c.rerank_score)
+    if c.dense_sim is not None:
+        return float(c.dense_sim)
+    return None
+
+
 def answer_query(
     retriever: "HybridFAQRetriever",
     user_query: str,
@@ -972,48 +1130,66 @@ def answer_query(
     llm_model: str = "llama3.2",
     debug: bool = False,
     sem_accept_threshold: float = 0.62,
-    coverage_fraction: float = 0.5,
+    rerank_accept_threshold: float = 0.0,
+    dense_floor: float = 0.50,
+    coverage_fraction: float = 0.5,  # deprecated: kept for call compatibility
 ) -> AnswerResult:
     """
-    Answer/abstain decision.
+    SEMANTIC-FIRST answer/abstain decision.
 
-    Two independent accept paths (either one answers):
-      1. Coverage floor: the candidate bundle lexically covers at least
-         ceil(coverage_fraction * N) of the in-corpus anchor concepts
-         (N = number of anchor concepts that actually appear in the corpus).
-         This replaces the old all-concepts AND gate.
-      2. Semantic accept: the top dense-retrieval candidate is at least
-         `sem_accept_threshold` cosine-similar to the query, regardless of
-         lexical overlap. This rescues lay/clinical wording mismatches.
+    The primary relevance signal is the cross-encoder rerank score (when
+    reranking is on) or dense cosine similarity (otherwise). Lexical / IDF
+    anchors NO LONGER gate the answer -- they only (a) shape the bundle for
+    multi-concept questions and (b) provide a recall safety net for rare,
+    highly specific terms. This is what lets the IDF anchor extractor stay
+    list-free without risking false abstentions.
 
-    Both thresholds MUST be calibrated on the gold eval set
-    (tests/eval_set.jsonl) for the deployed embedding model.
+    Accept if EITHER:
+      1. Primary: top candidate's relevance >= its threshold
+         (rerank >= `rerank_accept_threshold`, or dense >= `sem_accept_threshold`).
+      2. Lexical safety net: a candidate covers a HIGH-IDF anchor (idf >=
+         corpus average) AND is at least `dense_floor` cosine-similar. Catches
+         specific-term matches the reranker/embedder may under-score.
+
+    Thresholds MUST be calibrated on the gold eval set (tests/eval_set.jsonl)
+    for the deployed models. Defaults are conservative starting points, NOT
+    tuned values. For a patient-facing tool, watch the false-ANSWER rate when
+    lowering thresholds.
     """
     lang = retriever.language
     candidates = retriever.retrieve(user_query)
 
-    core_kws = extract_core_keywords(user_query, lang)
-    anchors = anchor_keywords(core_kws, lang)
-    anchor_concepts = _stem_set(anchors, lang)
-
-    # Prune anchor concepts that cannot possibly be covered because neither the
-    # concept nor any synonym appears in the corpus (e.g. "ever"). These were
-    # the direct cause of false abstentions under the old AND gate.
-    present_concepts = {c for c in anchor_concepts if retriever.stem_in_corpus(c)}
-    absent_concepts = anchor_concepts - present_concepts
+    ax = extract_anchor_concepts(user_query, lang, retriever)
+    anchors = ax.anchors
+    anchor_concepts = set(anchors)
+    strong_anchors = {a for a in anchor_concepts if retriever.idf(a) >= retriever.average_idf}
 
     stats_intent = _is_stats_intent(user_query, lang)
+    uses_rerank = any(c.rerank_score is not None for c in candidates)
     sem_top = _semantic_top(candidates)
     sem_top_sim = (sem_top.dense_sim if (sem_top and sem_top.dense_sim is not None) else None)
 
+    # Primary relevance: the single best candidate by the active signal.
+    def _prim(c: RetrievalCandidate) -> float:
+        v = _primary_relevance(c, uses_rerank)
+        return v if v is not None else -1e9
+
+    top_primary = max(candidates, key=_prim) if candidates else None
+    primary_threshold = rerank_accept_threshold if uses_rerank else sem_accept_threshold
+    primary_value = (_primary_relevance(top_primary, uses_rerank) if top_primary else None)
+
     dbg: Dict[str, Any] = {}
     if debug:
-        dbg["core_kws"] = core_kws
         dbg["anchors"] = anchors
-        dbg["anchor_stems"] = sorted(list(anchor_concepts))[:40]
-        dbg["present_concepts"] = sorted(list(present_concepts))[:40]
-        dbg["absent_concepts"] = sorted(list(absent_concepts))[:40]
+        dbg["strong_anchors"] = sorted(list(strong_anchors))
+        dbg["present_concepts"] = [f"{s}(idf={idf:.2f},df={d})" for (s, idf, d) in ax.present]
+        dbg["absent_concepts"] = ax.dropped_absent
+        dbg["dropped_common"] = ax.dropped_common
         dbg["stats_intent"] = stats_intent
+        dbg["uses_rerank"] = uses_rerank
+        dbg["primary_signal"] = "rerank" if uses_rerank else "dense"
+        dbg["primary_value"] = (round(primary_value, 4) if primary_value is not None else None)
+        dbg["primary_threshold"] = primary_threshold
         dbg["sem_top_sim"] = (round(sem_top_sim, 4) if sem_top_sim is not None else None)
         dbg["sem_accept_threshold"] = sem_accept_threshold
         dbg["qp_index_loaded"] = (retriever._index_qp is not None)  # type: ignore[attr-defined]
@@ -1025,41 +1201,28 @@ def answer_query(
             for c in candidates[:10]
         ]
 
-    # Only hard-abstain when there is nothing to work with at all. A query made
-    # up solely of drug/treatment terms (empty anchors) is NOT abstained here;
-    # it falls through to the semantic path below.
-    if len(core_kws) < 1 or not candidates:
+    if not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
     bundle: Optional[List[RetrievalCandidate]] = None
 
     # -----------------------
     # Stats questions: prefer a grounded statistic when the user asked for one.
-    # If no grounded statistic is found we do NOT hard-abstain: we fall through
-    # to the general path, which can still answer qualitatively from the FAQ
-    # (still quoting the FAQ, never fabricating numbers).
+    # If none is found we fall through (never fabricating numbers).
     # -----------------------
     if stats_intent:
-        # Only require concepts that actually appear in the corpus.
-        required_concepts = _stats_concept_stems_to_require(present_concepts, lang)
-
+        required_concepts = _stats_concept_stems_to_require(anchor_concepts, lang)
         if debug:
             dbg["stats_required_concepts"] = sorted(list(required_concepts))[:20]
 
         ok_stats_candidates: List[RetrievalCandidate] = []
         for c in candidates:
             text = f"{c.question} {c.section} {c.answer}"
-
-            # must be stats-like
             if not _passes_stats_gate(text, lang):
                 continue
-
-            # must match at least one non-broad concept if we have any
             if required_concepts:
-                cov = _anchor_overlap_concepts(text, required_concepts, lang)
-                if not cov:
+                if not _anchor_overlap_concepts(text, required_concepts, lang):
                     continue
-
             ok_stats_candidates.append(c)
 
         if debug:
@@ -1071,54 +1234,69 @@ def answer_query(
             if debug:
                 dbg["decision_path"] = "stats"
         elif debug:
-            # No grounded statistic; general path takes over below.
             dbg["stats_fell_through"] = True
 
     if bundle is None:
         # -----------------------
-        # General path: coverage floor OR semantic accept
-        # (also handles stats queries that found no grounded statistic)
+        # Semantic-first accept decision.
         # -----------------------
-        import math
+        primary_ok = (primary_value is not None) and (primary_value >= primary_threshold)
 
-        semantic_ok = (sem_top_sim is not None) and (sem_top_sim >= sem_accept_threshold)
+        # Lexical safety net: a candidate that covers a high-IDF anchor and is
+        # at least modestly similar. dense_sim is used because it is a stable
+        # [-1, 1] cosine regardless of whether reranking is on.
+        lexical_lead: Optional[RetrievalCandidate] = None
+        if strong_anchors:
+            for c in sorted(candidates, key=_score_candidate, reverse=True):
+                text = f"{c.question} {c.section} {c.answer}"
+                if not _anchor_overlap_concepts(text, strong_anchors, lang):
+                    continue
+                if c.dense_sim is not None and c.dense_sim < dense_floor:
+                    continue
+                lexical_lead = c
+                break
 
-        if not present_concepts:
-            # Nothing lexically anchorable (e.g. drug-only query, or all anchors
-            # are out-of-vocab). Rely entirely on the semantic signal.
+        if not (primary_ok or lexical_lead is not None):
             if debug:
-                dbg["decision_path"] = "semantic_only"
-            if semantic_ok and sem_top is not None:
-                bundle = [sem_top]
-            else:
-                return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
-        else:
-            n_present = len(present_concepts)
-            required = max(1, math.ceil(coverage_fraction * n_present))
+                dbg["decision_path"] = "abstain"
+            return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+
+        # Choose the lead: prefer the primary (most relevant) candidate.
+        lead = top_primary if primary_ok else lexical_lead
+        if debug:
+            dbg["decision_path"] = "semantic_primary" if primary_ok else "lexical_net"
+
+        # Bundle assembly: only independently-relevant candidates may join, so a
+        # strong lead is never padded with low-relevance entries. Coverage over
+        # the anchors pulls in genuinely distinct concepts (multi-part answers).
+        def _member_ok(c: RetrievalCandidate) -> bool:
+            v = _primary_relevance(c, uses_rerank)
+            if v is None:
+                return False
+            return v >= primary_threshold
+
+        relevant_pool = [c for c in candidates if _member_ok(c)]
+        if lead is not None and lead not in relevant_pool:
+            relevant_pool = [lead] + relevant_pool
+
+        if anchor_concepts:
             bundle, cov_details = _select_bundle_with_coverage(
-                candidates, lang, present_concepts, max_n=3,
-                min_member_sim=sem_accept_threshold,
+                relevant_pool, lang, anchor_concepts, max_n=3
             )
-            covered_n = len(cov_details["covered_concepts"])
-            coverage_ok = covered_n >= required
-            cov_details["required_cover_count"] = required
-            cov_details["covered_cover_count"] = covered_n
-            cov_details["coverage_ok"] = coverage_ok
             if debug:
                 dbg["coverage_gate"] = cov_details
-                dbg["decision_path"] = "coverage_floor+semantic"
+        else:
+            bundle = []
 
-            if not coverage_ok:
-                # Coverage floor missed. Rescue with a strong semantic match.
-                if semantic_ok and sem_top is not None:
-                    if sem_top not in bundle:
-                        bundle = [sem_top] + bundle
-                    if debug:
-                        dbg["decision_path"] = "semantic_rescue"
-                else:
-                    return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+        # Guarantee the lead is present and first.
+        if lead is not None:
+            bundle = [lead] + [c for c in bundle if c.index != lead.index]
+        if not bundle and lead is not None:
+            bundle = [lead]
 
         if not bundle:
+            if debug:
+                dbg["decision_path"] = "abstain"
             return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
     # Build FAQ answer
@@ -1156,14 +1334,16 @@ def print_debug(result: AnswerResult) -> None:
     if not result.debug:
         return
 
-    print("\n[DEBUG] core_kws:", result.debug.get("core_kws"))
-    print("[DEBUG] anchors:", result.debug.get("anchors"))
-    print("[DEBUG] anchor_stems:", result.debug.get("anchor_stems"))
-    print("[DEBUG] present_concepts:", result.debug.get("present_concepts"))
-    print("[DEBUG] absent_concepts:", result.debug.get("absent_concepts"))
+    print("\n[DEBUG] anchors:", result.debug.get("anchors"))
+    print("[DEBUG] strong_anchors:", result.debug.get("strong_anchors"))
+    print("[DEBUG] present_concepts (idf,df):", result.debug.get("present_concepts"))
+    print("[DEBUG] dropped_absent:", result.debug.get("absent_concepts"))
+    print("[DEBUG] dropped_common:", result.debug.get("dropped_common"))
     print("[DEBUG] stats_intent:", result.debug.get("stats_intent"))
-    print("[DEBUG] sem_top_sim:", result.debug.get("sem_top_sim"),
-          "(threshold:", str(result.debug.get("sem_accept_threshold")) + ")")
+    print("[DEBUG] primary_signal:", result.debug.get("primary_signal"),
+          "value:", result.debug.get("primary_value"),
+          "threshold:", result.debug.get("primary_threshold"))
+    print("[DEBUG] sem_top_sim:", result.debug.get("sem_top_sim"))
     print("[DEBUG] decision_path:", result.debug.get("decision_path"))
     print("[DEBUG] qp_index_loaded:", result.debug.get("qp_index_loaded"))
 

@@ -8,7 +8,7 @@ Corpus size at review: EN = 73 items, FR = 69 items (parsed from a single adjuva
 
 The retriever itself is not the problem. Hybrid fusion (BM25 + three FAISS indexes via RRF) surfaces genuinely relevant candidates. What blocks answers is the **post-retrieval keyword coverage gate** in `answer_query` (`rag_core.py:830-841`), which requires that *every* surviving query keyword be lexically matched in the candidate bundle (`covered == anchor_concepts`, `rag_core.py:704, 710, 834`). One junk word that is absent from the corpus is enough to force an abstention even when the correct answer was retrieved.
 
-Priority order per your instruction: expand the corpus first (Section 5), then loosen/replace the gate (Section 4). Both matter, but the corpus is the ceiling on everything else.
+Priority order for our project: expand the corpus first (Section 5), then loosen/replace the gate (Section 4). Both matter, but the corpus is the ceiling on everything else.
 
 ## 2. Root cause of the example failure (verified)
 
@@ -26,7 +26,7 @@ Traced through the actual code and corpus:
 | `stem('break')` in corpus | items 22, 66 |
 | `stem('increas')` in corpus | 11 items incl. 25, 28, 30, 43 |
 
-The debug you pasted confirms it: `bundle_cover_debug` shows idx 30 covered `increase` and idx 22 covered `break`. Both concepts that *could* be covered *were* covered. Only `ever` was left uncovered, so `coverage_complete = False` and the bot abstained.
+The debug trace confirms it: `bundle_cover_debug` shows idx 30 covered `increase` and idx 22 covered `break`. Both concepts that *could* be covered *were* covered. Only `ever` was left uncovered, so `coverage_complete = False` and the bot abstained.
 
 Two independent facts make this a clear bug, not correct caution:
 
@@ -48,7 +48,7 @@ These all live in `answer_query` and its helpers:
 
 **3.4 Empty-anchor abstention on drug-only queries.** `anchor_keywords` strips all drug/treatment terms (`rag_core.py:294-305`), and `answer_query` abstains if `len(anchors) < 1` (`rag_core.py:789`). So "Tell me about tamoxifen" → anchors `[]` → abstain, despite tamoxifen being the corpus's core topic.
 
-**3.5 No use of the similarity signal for the accept/reject decision.** Fused scores and the cross-encoder rerank score are computed but never thresholded. The keep/abstain decision is 100% lexical coverage. This is backwards: dense similarity is what tells you "this candidate is about the same thing," and it is discarded at exactly the moment it matters.
+**3.5 No use of the similarity signal for the accept/reject decision.** Fused scores and the cross-encoder rerank score are computed but never thresholded. The keep/abstain decision is 100% lexical coverage. This is backwards: dense similarity is what indicates "this candidate is about the same thing," and it is discarded at exactly the moment it matters.
 
 **3.6 Redundant query encoding.** `retrieve` encodes the identical string `f"Question: {user_query}"` three times for the q / qa / qp indexes (`rag_core.py:438-448`). Harmless but wasteful, and it means the three indexes differ only on the document side.
 
@@ -64,7 +64,7 @@ Do these on the existing 73/69-item corpus; none require re-ingesting except 4.6
 
 4. **Broaden the synonym map** in `_concept_match_stems`: add `break↔pause↔stop↔interrupt↔discontinue↔hold`, `pregnant↔pregnancy↔conceive↔conception`, `tired↔fatigue`, `bloodwork↔blood test`, etc. Stopgap until #2 makes it unnecessary.
 
-5. **Turn on reranking by default.** The cross-encoder is implemented (`rag_core.py:485-496`) but `--rerank` is off (`chatbot.py:28`). Enabling it reorders candidates so the gate and the "best" selection operate on better-ordered results. Measure latency on your target hardware first.
+5. **Turn on reranking by default.** The cross-encoder is implemented (`rag_core.py:485-496`) but `--rerank` is off (`chatbot.py:28`). Enabling it reorders candidates so the gate and the "best" selection operate on better-ordered results. Measure latency on the target hardware first.
 
 6. **Fix ingest parse artifacts.** Answer fragments are being stored as questions: idx 7 ("Do not double up to make up for a missed dose."), idx 27 (the bisphosphonates sentence), and context-less stubs like idx 40 ("Is this common?"). These come from `looks_like_question_sentence`/`is_heading` misfiring in `parse_docx_into_qa` (`ingest_faq.py:81-213`). They pollute retrieval and coverage. Re-parse with tighter rules and spot-check with `--inspect`.
 
@@ -76,17 +76,17 @@ Do these on the existing 73/69-item corpus; none require re-ingesting except 4.6
 - The whole system is capped by 73 EN / 69 FR items from one document each. Broaden sources (clinical FAQs, patient-education material, oncology society guidance) and, critically, **chunk answers** rather than indexing only one Q per answer, so sub-topics inside long answers (e.g. the "therapeutic break" line buried in idx 22) become independently retrievable.
 - Add lay-language question variants per entry. The paraphrase augmentation (`--augment-questions`, already `True` in the saved data) is the right idea; verify the llama3.2 paraphrase quality, since bad paraphrases add noise.
 
-**5.2 Build an evaluation set before tuning anything further.** Collect real patient questions (the audit log at `logs/audit.jsonl` is a start) and label the gold FAQ id(s) for each. Track **recall@k, abstention rate, and false-abstention rate**. You cannot tell whether a gate change helps without this. This should gate every change in Section 4.
+**5.2 Build an evaluation set before tuning anything further.** Collect real patient questions (the audit log at `logs/audit.jsonl` is a start) and label the gold FAQ id(s) for each. Track **recall@k, abstention rate, and false-abstention rate**. There is no way to tell whether a gate change helps without this. This should gate every change in Section 4.
 
-**5.3 Replace hand-crafted linguistics with learned components.** The stopword/generic/synonym/stemmer machinery is brittle and language-forked. Move the lay↔clinical mapping into either (a) an LLM query-rewrite/expansion step at query time, or (b) a domain-adapted bi-encoder fine-tuned on your Q–Q and Q–A pairs. Either handles "break↔pause" without a maintained dictionary.
+**5.3 Replace hand-crafted linguistics with learned components.** The stopword/generic/synonym/stemmer machinery is brittle and language-forked. Move the lay↔clinical mapping into either (a) an LLM query-rewrite/expansion step at query time, or (b) a domain-adapted bi-encoder fine-tuned on the project's Q–Q and Q–A pairs. Either handles "break↔pause" without a maintained dictionary.
 
-**5.4 Make abstention a calibrated decision, not a lexical one.** Use the cross-encoder rerank score plus a threshold tuned on 5.2 to decide answer vs. abstain. This directly replaces the AND gate with something measurable and safety-tunable (you can pick the operating point on the precision/recall curve you're comfortable defending clinically).
+**5.4 Make abstention a calibrated decision, not a lexical one.** Use the cross-encoder rerank score plus a threshold tuned on 5.2 to decide answer vs. abstain. This directly replaces the AND gate with something measurable and safety-tunable (the operating point can be chosen on the precision/recall curve the team is comfortable defending clinically).
 
 **5.5 Improve the abstention UX.** When the gate blocks but near-miss candidates exist, surface them ("The closest topics I have are: pausing therapy for pregnancy; options when side effects are hard to tolerate") instead of a flat "I can't answer." Distinguish "blocked a relevant chunk" from "genuinely no content" using the semantic score.
 
 ## 6. Safety note
 
-The strict gate is clearly deliberate — for a patient-facing oncology tool, false answers are worse than abstentions, and that instinct is correct. The recommendations above do not remove that guardrail; they move it from a brittle lexical proxy (which currently produces *false* abstentions on in-corpus content) to a calibrated semantic threshold you can tune and defend with data. Keep the "FAQ-only, no invented facts" contract; make the accept/reject boundary measurable.
+The strict gate is clearly deliberate — for a patient-facing oncology tool, false answers are worse than abstentions, and that instinct is correct. The recommendations above do not remove that guardrail; they move it from a brittle lexical proxy (which currently produces *false* abstentions on in-corpus content) to a calibrated semantic threshold we can tune and defend with data. Keep the "FAQ-only, no invented facts" contract; make the accept/reject boundary measurable.
 
 ## 7. Implemented (2026-07-23) — short-term fixes + eval harness
 
@@ -104,7 +104,7 @@ New tunables surfaced on the CLI: `--sem-threshold`, `--coverage-fraction`.
 
 ### How this was verified
 
-The macOS venv does not run in a Linux sandbox and the embedding model was not available there, so the **full pipeline (real embeddings + FAISS) must be evaluated on your machine**. The gate/keyword/pruning/artifact logic was verified against the real corpus by stubbing only the embedding/index layer and replaying the actual candidate set from your debug output. Confirmed:
+The macOS venv does not run in a Linux sandbox and the embedding model was not available there, so the **full pipeline (real embeddings + FAISS) must be evaluated in our local environment**. The gate/keyword/pruning/artifact logic was verified against the real corpus by stubbing only the embedding/index layer and replaying an actual candidate set from a debug run. Confirmed:
 
 1. The original example now **answers** (path `coverage_floor+semantic`; `ever` pruned; `break` covered by idx 22, `increase` by idx 30 — idx 22's answer is the "therapeutic break" content).
 2. Out-of-scope "capital of France" **abstains** (no in-corpus concepts, dense sim below threshold).
@@ -121,6 +121,18 @@ Follow-up after testing surfaced a second false-abstention class, e.g. *"How lon
 - **Fix C — bundle precision guard:** secondary bundle members must clear the semantic bar (`min_member_sim = sem_accept_threshold`). This stops a strong lead answer from being padded with low-relevance entries that merely share a weak keyword (the "how long" query was pulling in idx 35 "long flights"/"stay hydrated"). Genuine multi-concept answers (e.g. osteoporosis + depression) are unaffected because both members clear the bar.
 
 Re-verified on the real corpus by replaying the exact candidate set from the debug: "how long" now answers with idx 2 alone; the osteoporosis+depression multi-concept case still bundles both; the original break/risk example still answers; stats classification is correct on 8 EN/FR probes.
+
+### Round 3 (2026-07-23) — long-term: IDF anchors + semantic-first gate
+
+This replaces the brittle machinery rather than patching it, per the corpus-expansion priority.
+
+- **IDF-weighted anchor extraction (replaces the word lists).** At load, the retriever computes per-stem document frequency and smoothed IDF over the corpus (`_stem_df`, `_stem_idf`, `average_idf`). `extract_anchor_concepts` selects anchors as stems that are present (df >= 1) and discriminative (df <= 0.5 x corpus_size). Common domain words ("hormone" df 53, "therapy" df 55, "take" df 40) get low weight and drop out automatically; absent fillers ("ever") drop out; no `GENERIC`/`EMOTION`/drug list is consulted. Only a small, domain-independent grammatical/discourse stop set remains (closed-class function words, which don't change with the domain). The old `extract_core_keywords`/`anchor_keywords` and the domain lists are retained in the file but no longer used by the gate.
+- **Semantic-first gate.** The accept/abstain decision is now driven by the cross-encoder rerank score (when reranking is on) or dense cosine (otherwise), NOT by lexical coverage. Lexical/IDF anchors only (a) shape the bundle for multi-concept questions and (b) act as a recall safety net: a candidate covering a HIGH-IDF anchor (idf >= corpus average) at >= `dense_floor` cosine can still answer. Every bundle member must independently clear the accept threshold, so a strong lead is never padded with weak entries.
+- **New tunables** (defaults are conservative starting points, NOT calibrated): `rerank_accept_threshold=0.0`, `sem_accept_threshold=0.62` (dense, used when rerank off), `dense_floor=0.50`. Surfaced on the CLI as `--rerank-threshold`, `--sem-threshold`, `--dense-floor`. `coverage_fraction` is deprecated (kept only for call compatibility).
+
+Verified on the real corpus by replaying candidate sets with realistic rerank/dense values: IDF extraction drops "hormone/therapy/take" (common) and "ever" (absent) with no lists; "how long" answers via rerank-primary (idx 2); the break/risk example answers via dense-primary; "capital of France" abstains; drug-only "aromatase inhibitors" answers via primary (idx 3); osteoporosis+depression bundles both; an ungrounded stats question abstains.
+
+**Calibration is now the critical step and it must run in our local environment.** The whole gate hinges on the two thresholds, and for a patient-facing tool the false-ANSWER rate is the number to protect. Sweep `--rerank-threshold` (reranking is on by default, so this is the one that matters) against the gold set and pick the point that minimises false-abstention while keeping false-answer at/near zero. `average_idf` as the "strong anchor" bar for the safety net is also a heuristic worth revisiting as the corpus grows.
 
 ### Gold eval set — run before shipping any change
 
