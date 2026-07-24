@@ -611,6 +611,7 @@ class HybridFAQRetriever:
         self._cross_encoder = None
 
         self._stored_embedding_model_name: Optional[str] = None
+        self._query_prefix: str = ""
 
         # Set of every stem that appears anywhere in the corpus. Used to prune
         # anchor concepts that can never be covered (junk/out-of-vocab tokens).
@@ -635,6 +636,9 @@ class HybridFAQRetriever:
             payload = pickle.load(f)
         self._items = payload["items"]
         self._stored_embedding_model_name = payload.get("embedding_model_name")
+        # Model-agnostic query prefix (e.g. "query: " for e5). Empty for mpnet /
+        # BGE-M3. Ingestion stores the matching passage prefix on the doc side.
+        self._query_prefix = payload.get("query_prefix", "") or ""
 
         # Precompute per-stem document frequency and smoothed IDF over the
         # corpus (question + section + answer + any stored paraphrases). This
@@ -748,7 +752,7 @@ class HybridFAQRetriever:
 
         # The three dense indexes are queried with the same encoded vector; only
         # the document side differs, so encode once (was encoded three times).
-        q_emb = self._encode(f"Question: {user_query}")
+        q_emb = self._encode(f"{self._query_prefix}Question: {user_query}")
         Dq, Iq = self._index_q.search(q_emb, self.top_k)
         Dqa, Iqa = self._index_qa.search(q_emb, self.top_k)
 
@@ -801,7 +805,10 @@ class HybridFAQRetriever:
             question = str(it.get("question", ""))
             # Runtime artifact filter: drop answer-fragments mis-parsed as
             # questions in the prebuilt indexes (see _looks_like_faq_question).
-            if not _looks_like_faq_question(question):
+            # Only applies to FAQ items -- article "questions" are heading
+            # breadcrumbs and are not expected to be well-formed questions.
+            source_type = str(it.get("source_type", "faq"))
+            if source_type == "faq" and not _looks_like_faq_question(question):
                 continue
             candidates.append(
                 RetrievalCandidate(

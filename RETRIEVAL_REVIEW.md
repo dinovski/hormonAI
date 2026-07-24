@@ -134,6 +134,38 @@ Verified on the real corpus by replaying candidate sets with realistic rerank/de
 
 **Calibration is now the critical step and it must run in our local environment.** The whole gate hinges on the two thresholds, and for a patient-facing tool the false-ANSWER rate is the number to protect. Sweep `--rerank-threshold` (reranking is on by default, so this is the one that matters) against the gold set and pick the point that minimises false-abstention while keeping false-answer at/near zero. `average_idf` as the "strong anchor" bar for the safety net is also a heuristic worth revisiting as the corpus grows.
 
+### Round 4 (2026-07-23) — type-aware, model-agnostic ingestion (`ingest.py`)
+
+Groundwork for corpus expansion. A new `ingest.py` replaces the FAQ-only pipeline with two handlers feeding one unified schema, so FAQs and articles are retrieved uniformly.
+
+- **FAQ handler:** reuses the original `ingest_faq.py` Q/A parser (kept intact for back-compat). One chunk per Q/A, question and answer together.
+- **Article handler:** splits on the document's own headings (docx Heading styles or markdown `#`), then splits long sections into fixed-size (~250-word, configurable) child chunks with overlap, never breaking mid-sentence. Each child carries a heading breadcrumb (`Hormone Therapy > Side Effects > Bone health`) and a link to its parent section text (`parent_id`, `parent_text`) for future parent-document retrieval. This follows the current evidence: heading-aligned splitting plus fixed-size children, not costly semantic chunking.
+- **Unified schema:** `{id, source_id, source_type, lang, section, heading_path, question, answer, parent_id, parent_text, q_paraphrases}`. A compatible superset of the old schema, so the retriever reads it unchanged. For article chunks the heading breadcrumb is the `question` (topic) side of the index and the chunk text is the `answer` body.
+- **Model-agnostic:** `--embedding-model` takes any SentenceTransformer (mpnet, BGE-M3, e5, ...). `--passage-prefix`/`--query-prefix` support instruction-tuned models (e.g. e5's `passage: `/`query: `); the query prefix is stored in the payload and applied by rag_core at query time. Per-language artifacts keep the exact filenames rag_core loads, so swapping models is a re-ingest plus an eval re-calibration, nothing more.
+- **rag_core adjustments:** the FAQ artifact filter now applies only to `source_type == "faq"` items (article breadcrumbs are not expected to be well-formed questions); the query encoder prepends the stored `query_prefix`. Legacy pickles without these keys default cleanly (`source_type` -> faq, prefix -> "").
+
+Sources are declared via a JSON manifest or convenience flags. Example manifest:
+
+```json
+[
+  {"path": "faq_adjuvant_en.docx",   "type": "faq",     "lang": "en"},
+  {"path": "faq_adjuvant_fr.docx",   "type": "faq",     "lang": "fr"},
+  {"path": "articles/bone_health.md","type": "article", "lang": "en"},
+  {"path": "articles/nutrition_fr.docx","type": "article","lang": "fr"}
+]
+```
+
+```
+# rebuild indexes with the default model
+python ingest.py --manifest manifest.json
+
+# A/B a different embedding model through the same eval harness
+python ingest.py --manifest manifest.json \
+  --embedding-model BAAI/bge-m3 --out-prefix faq_bgem3
+```
+
+Verified the parsing/chunking/schema logic on sample text (embedding model not runnable in this environment): chunker respects size and overlap and never splits mid-sentence, nested heading breadcrumbs and parent links are built, the unified schema is emitted for both types, and article items correctly bypass the FAQ artifact filter while FAQ fragments are still dropped. Full embedding + retrieval must be run and re-calibrated locally after choosing a model.
+
 ### Gold eval set — run before shipping any change
 
 `tests/eval_set.jsonl` holds 53 labelled cases (EN + FR) across categories: paraphrase, synonym, multi-concept, filler, drug-only, emotional, stats, duration, and out-of-scope, each with expected answer/abstain behaviour and gold FAQ indices. `tests/eval_retrieval.py` runs them through the real pipeline and reports recall@k, decision accuracy, false-abstention rate, false-answer rate, lead-source correctness, and per-category/per-language breakdowns; it exits non-zero if any core case regresses (CI-friendly).
