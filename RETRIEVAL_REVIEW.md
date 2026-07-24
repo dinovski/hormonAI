@@ -6,7 +6,7 @@ Corpus size at review: EN = 73 items, FR = 69 items (parsed from a single adjuva
 
 ## 1. TL;DR
 
-The retriever itself is not the problem. Hybrid fusion (BM25 + three FAISS indexes via RRF) surfaces genuinely relevant candidates. What blocks answers is the **post-retrieval keyword coverage gate** in `answer_query` (`rag_core.py:830-841`), which requires that *every* surviving query keyword be lexically matched in the candidate bundle (`covered == anchor_concepts`, `rag_core.py:704, 710, 834`). One junk word that is absent from the corpus is enough to force an abstention even when the correct answer was retrieved.
+Hybrid fusion (BM25 + three FAISS indexes via RRF) surfaces genuinely relevant candidates. What blocks answers is the **post-retrieval keyword coverage gate** in `answer_query` (`rag_core.py:830-841`), which requires that *every* surviving query keyword be lexically matched in the candidate bundle (`covered == anchor_concepts`, `rag_core.py:704, 710, 834`). One junk word that is absent from the corpus is enough to force an abstention even when the correct answer was retrieved.
 
 Priority order for our project: expand the corpus first (Section 5), then loosen/replace the gate (Section 4). Both matter, but the corpus is the ceiling on everything else.
 
@@ -86,7 +86,7 @@ Do these on the existing 73/69-item corpus; none require re-ingesting except 4.6
 
 ## 6. Safety note
 
-The strict gate is clearly deliberate — for a patient-facing oncology tool, false answers are worse than abstentions, and that instinct is correct. The recommendations above do not remove that guardrail; they move it from a brittle lexical proxy (which currently produces *false* abstentions on in-corpus content) to a calibrated semantic threshold we can tune and defend with data. Keep the "FAQ-only, no invented facts" contract; make the accept/reject boundary measurable.
+The strict gate is deliberate — for a patient-facing oncology tool, false answers are worse than abstentions. The recommendations above do not remove that guardrail; they move it from a brittle lexical proxy (which currently produces *false* abstentions on in-corpus content) to a calibrated semantic threshold we can tune and defend with data. Keep the "corpus-only, no invented facts" contract; make the accept/reject boundary measurable.
 
 ## 7. Implemented (2026-07-23) — short-term fixes + eval harness
 
@@ -165,6 +165,24 @@ python ingest.py --manifest manifest.json \
 ```
 
 Verified the parsing/chunking/schema logic on sample text (embedding model not runnable in this environment): chunker respects size and overlap and never splits mid-sentence, nested heading breadcrumbs and parent links are built, the unified schema is emitted for both types, and article items correctly bypass the FAQ artifact filter while FAQ fragments are still dropped. Full embedding + retrieval must be run and re-calibrated locally after choosing a model.
+
+### Round 5 (2026-07-23) — shared multilingual space + cross-lingual fallback
+
+Moves retrieval from separate per-language indexes to one shared multilingual embedding space, with same-language answers preferred and cross-lingual used only as a recall fallback.
+
+- **Shared index (`ingest.py`):** in addition to the per-language `faq_<lang>_*` artifacts, ingestion now builds a combined `faq_all_*` index across every language (one multilingual model, one FAISS/BM25, every item carrying its own `lang` tag). Toggle with `--shared/--no-shared` and `--per-language/--no-per-language`.
+- **Per-language IDF, one corpus (`rag_core.py`):** the retriever now computes IDF/anchor statistics per language and keys them on the active query language, so a mixed FR/EN corpus still yields clean, language-correct anchors. `RetrievalCandidate` carries `lang`.
+- **Same-language first, cross-lingual fallback:** the accept decision runs first over same-language candidates; only if that abstains does it retry over the other language. A cross-lingual answer is prefixed with a localized notice ("This information is only available in French." / "Cette information n'est disponible qu'en anglais.") and the FAQ content is quoted verbatim, never machine-translated, preserving the no-fabrication contract. Per-language mode is unchanged (the cross set is empty).
+- **App wiring (`hormonai_app.py`):** loads the shared index and sets the query language per request; falls back to per-language indexes automatically if `faq_all_*` has not been built yet.
+- **Model-agnostic still holds:** the shared space uses the one `--embedding-model`; different models per language would break the shared space and are explicitly avoided.
+
+Verified on a synthetic bilingual corpus (embedding model not runnable here): same-language queries answer without a notice; a query whose only relevant content is in the other language answers via the cross-lingual fallback with the correct notice; genuinely out-of-scope queries abstain in both languages; per-language mode is unaffected; and per-language IDF buckets are language-correct (a French stem is "in corpus" for French, an English stem is not).
+
+Operational notes: this needs a re-ingest to produce `faq_all_*` (`python ingest.py --manifest manifest.json`). Thresholds remain model-specific and must be re-calibrated after any model swap. The gold eval set currently uses per-language positional `gold_idx`, so evaluating the cross-lingual path will need gold IDs keyed by item id rather than position (follow-up).
+
+### Chat display name
+
+The chat box now shows "Mona" (chat panel title and bot message label). The tool/app name remains HormonAI everywhere else (page title, header, logo, about text).
 
 ### Gold eval set — run before shipping any change
 

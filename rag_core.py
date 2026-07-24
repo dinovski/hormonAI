@@ -510,7 +510,7 @@ def extract_anchor_concepts(
     words, and drug names that saturate the corpus, with zero curation.
     """
     lang = _norm_lang(language)
-    cap = max(1, int(retriever._corpus_size * max_df_fraction))
+    cap = max(1, int(retriever.corpus_size * max_df_fraction))
 
     seen: Set[str] = set()
     present: List[Tuple[str, float, int]] = []
@@ -568,6 +568,9 @@ class RetrievalCandidate:
     # Used by the semantic-accept path so the answer/abstain decision is not
     # purely lexical. None when no dense index returned this candidate.
     dense_sim: Optional[float] = None
+    # Language of the source item ("en"/"fr"). Used for same-language-first
+    # selection with cross-lingual fallback in shared mode.
+    lang: str = ""
 
 
 @dataclass
@@ -593,11 +596,21 @@ class HybridFAQRetriever:
         embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         rerank: bool = False,
         rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        shared: bool = False,
+        corpus_prefix: Optional[str] = None,
     ):
+        # `language` is the ACTIVE QUERY language (drives stemming, IDF anchors,
+        # query prefix). In shared mode the corpus contains all languages and
+        # this attribute may be reassigned per query.
         self.language = _norm_lang(language)
         self.data_dir = data_dir
         self.top_k = top_k
         self.embedding_model_name = embedding_model
+        # Shared multilingual mode: load one combined index ('<prefix>_all_*')
+        # spanning all languages, prefer same-language candidates, fall back
+        # cross-lingual. `corpus_prefix` overrides the loaded basename.
+        self.shared = shared
+        self.corpus_prefix = corpus_prefix
 
         self.rerank = rerank
         self.rerank_model = rerank_model
@@ -613,19 +626,19 @@ class HybridFAQRetriever:
         self._stored_embedding_model_name: Optional[str] = None
         self._query_prefix: str = ""
 
-        # Set of every stem that appears anywhere in the corpus. Used to prune
-        # anchor concepts that can never be covered (junk/out-of-vocab tokens).
-        self._corpus_stems: Set[str] = set()
-
-        # Corpus statistics for IDF-weighted anchor extraction (replaces the
-        # hand-maintained stopword / generic / emotion word lists).
-        self._corpus_size: int = 0
-        self._stem_df: Dict[str, int] = {}     # document frequency per stem
-        self._stem_idf: Dict[str, float] = {}  # smoothed inverse doc frequency
-        self._average_idf: float = 0.0
+        # Per-language corpus statistics for IDF-weighted anchor extraction
+        # (replaces the hand-maintained stopword / generic / emotion lists).
+        # Keyed by language: {lang: {df, idf, avg, stems, size}}. Accessors use
+        # the ACTIVE query language so the same combined corpus serves both.
+        self._stats_by_lang: Dict[str, Dict[str, Any]] = {}
 
     def load(self) -> None:
-        prefix = f"faq_{self.language}"
+        if self.corpus_prefix:
+            prefix = self.corpus_prefix
+        elif self.shared:
+            prefix = "faq_all"
+        else:
+            prefix = f"faq_{self.language}"
         qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
         bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
         idx_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
@@ -640,32 +653,33 @@ class HybridFAQRetriever:
         # BGE-M3. Ingestion stores the matching passage prefix on the doc side.
         self._query_prefix = payload.get("query_prefix", "") or ""
 
-        # Precompute per-stem document frequency and smoothed IDF over the
-        # corpus (question + section + answer + any stored paraphrases). This
-        # drives IDF-weighted anchor extraction: common words (high df, e.g.
-        # "hormone", "take") get low weight automatically, so no stopword or
-        # domain "generic" list needs to be maintained. Absent words get df=0.
-        df: "Counter[str]" = Counter()
+        # Precompute per-LANGUAGE stem document frequency and smoothed IDF.
+        # Each item is stemmed in its OWN language, so a shared multilingual
+        # corpus still yields clean, language-correct anchor statistics. Common
+        # words (high df, e.g. "hormone") get low weight automatically -- no
+        # stopword/generic list needed. Accessors below key on the active query
+        # language.
+        df_by_lang: Dict[str, "Counter[str]"] = {}
+        size_by_lang: Dict[str, int] = {}
         for it in self._items:
+            lg = _norm_lang(it.get("lang", self.language))
             blob = f"{it.get('question','')} {it.get('section','')} {it.get('answer','')}"
             for para in (it.get("q_paraphrases") or []):
                 blob += " " + str(para)
-            # count each stem once per document
-            for s in _stem_set(_tokenize(blob), self.language):
-                df[s] += 1
+            d = df_by_lang.setdefault(lg, Counter())
+            for s in _stem_set(_tokenize(blob), lg):  # each stem once per doc
+                d[s] += 1
+            size_by_lang[lg] = size_by_lang.get(lg, 0) + 1
 
-        self._corpus_size = max(1, len(self._items))
-        self._stem_df = dict(df)
-        # Smoothed IDF, always positive: log((N+1)/(df+1)) + 1
-        self._stem_idf = {
-            s: math.log((self._corpus_size + 1) / (c + 1)) + 1.0
-            for s, c in self._stem_df.items()
-        }
-        self._average_idf = (
-            sum(self._stem_idf.values()) / len(self._stem_idf)
-            if self._stem_idf else 0.0
-        )
-        self._corpus_stems = set(self._stem_df.keys())
+        self._stats_by_lang = {}
+        for lg, d in df_by_lang.items():
+            size = max(1, size_by_lang.get(lg, 1))
+            idf = {s: math.log((size + 1) / (c + 1)) + 1.0 for s, c in d.items()}
+            avg = (sum(idf.values()) / len(idf)) if idf else 0.0
+            self._stats_by_lang[lg] = {
+                "df": dict(d), "idf": idf, "avg": avg,
+                "stems": set(d.keys()), "size": size,
+            }
 
         with open(bm25_path, "rb") as f:
             payload_bm25 = pickle.load(f)
@@ -717,27 +731,40 @@ class HybridFAQRetriever:
         faiss.normalize_L2(emb)
         return emb
 
+    def _active_stats(self) -> Dict[str, Any]:
+        """Corpus statistics for the active query language."""
+        return self._stats_by_lang.get(
+            self.language, {"df": {}, "idf": {}, "avg": 0.0, "stems": set(), "size": 1}
+        )
+
+    @property
+    def corpus_size(self) -> int:
+        return self._active_stats()["size"]
+
     def stem_in_corpus(self, stem: str) -> bool:
-        """True if the given stem (or any of its synonyms) appears in the corpus."""
-        if not self._corpus_stems:
-            return True  # corpus stems unavailable: do not prune
+        """True if the stem (or a synonym) appears in the active-language corpus."""
+        stems = self._active_stats()["stems"]
+        if not stems:
+            return True  # stats unavailable: do not prune
         acceptable = _concept_match_stems(stem, self.language)
-        return len(self._corpus_stems.intersection(acceptable)) > 0
+        return len(stems.intersection(acceptable)) > 0
 
     def df(self, stem: str) -> int:
         """Document frequency of a stem (max over its synonym group)."""
+        d = self._active_stats()["df"]
         acceptable = _concept_match_stems(stem, self.language)
-        return max((self._stem_df.get(a, 0) for a in acceptable), default=0)
+        return max((d.get(a, 0) for a in acceptable), default=0)
 
     def idf(self, stem: str) -> float:
         """Smoothed IDF of a stem (min over its synonym group; 0.0 if absent)."""
+        idf_map = self._active_stats()["idf"]
         acceptable = _concept_match_stems(stem, self.language)
-        vals = [self._stem_idf[a] for a in acceptable if a in self._stem_idf]
+        vals = [idf_map[a] for a in acceptable if a in idf_map]
         return min(vals) if vals else 0.0
 
     @property
     def average_idf(self) -> float:
-        return self._average_idf
+        return self._active_stats()["avg"]
 
     def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
         if not self._items:
@@ -818,6 +845,7 @@ class HybridFAQRetriever:
                     answer=str(it.get("answer", "")),
                     fused_score=float(score),
                     dense_sim=(dense_sim.get(int(idx)) if int(idx) in dense_sim else None),
+                    lang=_norm_lang(str(it.get("lang", self.language))),
                 )
             )
 
@@ -1130,6 +1158,128 @@ def _primary_relevance(c: RetrievalCandidate, uses_rerank: bool) -> Optional[flo
     return None
 
 
+def _crosslingual_notice(query_lang: str, answer_lang: str) -> str:
+    """One-line note shown when the only relevant content is in another language."""
+    q, a = _norm_lang(query_lang), _norm_lang(answer_lang)
+    if q == a:
+        return ""
+    if q == "fr":
+        names = {"en": "anglais", "fr": "français"}
+        return f"(Cette information n’est disponible qu’en {names.get(a, a)}.)"
+    names = {"en": "English", "fr": "French"}
+    return f"(This information is only available in {names.get(a, a)}.)"
+
+
+def _decide_bundle(
+    retriever: "HybridFAQRetriever",
+    cands: List[RetrievalCandidate],
+    lang: str,
+    anchor_concepts: Set[str],
+    strong_anchors: Set[str],
+    stats_intent: bool,
+    thresholds: Dict[str, float],
+    dbg: Dict[str, Any],
+    debug: bool,
+) -> Optional[List[RetrievalCandidate]]:
+    """
+    Run the semantic-first accept decision over ONE candidate subset (used once
+    for same-language candidates, then again for cross-language as a fallback).
+    Returns the answer bundle, or None to abstain. Writes decision debug into
+    `dbg`.
+    """
+    if not cands:
+        if debug:
+            dbg["decision_path"] = "abstain(no_candidates)"
+        return None
+
+    sem_accept_threshold = thresholds["sem_accept_threshold"]
+    rerank_accept_threshold = thresholds["rerank_accept_threshold"]
+    dense_floor = thresholds["dense_floor"]
+
+    uses_rerank = any(c.rerank_score is not None for c in cands)
+
+    def _prim(c: RetrievalCandidate) -> float:
+        v = _primary_relevance(c, uses_rerank)
+        return v if v is not None else -1e9
+
+    top_primary = max(cands, key=_prim)
+    primary_threshold = rerank_accept_threshold if uses_rerank else sem_accept_threshold
+    primary_value = _primary_relevance(top_primary, uses_rerank)
+
+    if debug:
+        dbg["primary_signal"] = "rerank" if uses_rerank else "dense"
+        dbg["primary_value"] = round(primary_value, 4) if primary_value is not None else None
+        dbg["primary_threshold"] = primary_threshold
+
+    # Stats preference: answer with a grounded statistic if the user asked for one.
+    if stats_intent:
+        required = _stats_concept_stems_to_require(anchor_concepts, lang)
+        ok_stats: List[RetrievalCandidate] = []
+        for c in cands:
+            text = f"{c.question} {c.section} {c.answer}"
+            if not _passes_stats_gate(text, lang):
+                continue
+            if required and not _anchor_overlap_concepts(text, required, lang):
+                continue
+            ok_stats.append(c)
+        if debug:
+            dbg["stats_gate_candidates"] = [{"idx": c.index} for c in ok_stats[:10]]
+        if ok_stats:
+            best = sorted(ok_stats, key=_score_candidate, reverse=True)[0]
+            if debug:
+                dbg["decision_path"] = "stats"
+            return [best]
+        elif debug:
+            dbg["stats_fell_through"] = True
+
+    primary_ok = (primary_value is not None) and (primary_value >= primary_threshold)
+
+    # Lexical safety net: a candidate covering a high-IDF anchor at >= dense_floor.
+    lexical_lead: Optional[RetrievalCandidate] = None
+    if strong_anchors:
+        for c in sorted(cands, key=_score_candidate, reverse=True):
+            text = f"{c.question} {c.section} {c.answer}"
+            if not _anchor_overlap_concepts(text, strong_anchors, lang):
+                continue
+            if c.dense_sim is not None and c.dense_sim < dense_floor:
+                continue
+            lexical_lead = c
+            break
+
+    if not (primary_ok or lexical_lead is not None):
+        if debug:
+            dbg["decision_path"] = "abstain"
+        return None
+
+    lead = top_primary if primary_ok else lexical_lead
+    if debug:
+        dbg["decision_path"] = "semantic_primary" if primary_ok else "lexical_net"
+
+    def _member_ok(c: RetrievalCandidate) -> bool:
+        v = _primary_relevance(c, uses_rerank)
+        return v is not None and v >= primary_threshold
+
+    relevant_pool = [c for c in cands if _member_ok(c)]
+    if lead is not None and lead not in relevant_pool:
+        relevant_pool = [lead] + relevant_pool
+
+    if anchor_concepts:
+        bundle, cov_details = _select_bundle_with_coverage(
+            relevant_pool, lang, anchor_concepts, max_n=3
+        )
+        if debug:
+            dbg["coverage_gate"] = cov_details
+    else:
+        bundle = []
+
+    if lead is not None:
+        bundle = [lead] + [c for c in bundle if c.index != lead.index]
+    if not bundle and lead is not None:
+        bundle = [lead]
+
+    return bundle if bundle else None
+
+
 def answer_query(
     retriever: "HybridFAQRetriever",
     user_query: str,
@@ -1163,155 +1313,84 @@ def answer_query(
     tuned values. For a patient-facing tool, watch the false-ANSWER rate when
     lowering thresholds.
     """
-    lang = retriever.language
+    lang = _norm_lang(retriever.language)
     candidates = retriever.retrieve(user_query)
 
     ax = extract_anchor_concepts(user_query, lang, retriever)
     anchors = ax.anchors
     anchor_concepts = set(anchors)
     strong_anchors = {a for a in anchor_concepts if retriever.idf(a) >= retriever.average_idf}
-
     stats_intent = _is_stats_intent(user_query, lang)
-    uses_rerank = any(c.rerank_score is not None for c in candidates)
+
     sem_top = _semantic_top(candidates)
     sem_top_sim = (sem_top.dense_sim if (sem_top and sem_top.dense_sim is not None) else None)
 
-    # Primary relevance: the single best candidate by the active signal.
-    def _prim(c: RetrievalCandidate) -> float:
-        v = _primary_relevance(c, uses_rerank)
-        return v if v is not None else -1e9
-
-    top_primary = max(candidates, key=_prim) if candidates else None
-    primary_threshold = rerank_accept_threshold if uses_rerank else sem_accept_threshold
-    primary_value = (_primary_relevance(top_primary, uses_rerank) if top_primary else None)
-
     dbg: Dict[str, Any] = {}
     if debug:
+        dbg["query_lang"] = lang
+        dbg["shared_mode"] = bool(getattr(retriever, "shared", False))
         dbg["anchors"] = anchors
         dbg["strong_anchors"] = sorted(list(strong_anchors))
         dbg["present_concepts"] = [f"{s}(idf={idf:.2f},df={d})" for (s, idf, d) in ax.present]
         dbg["absent_concepts"] = ax.dropped_absent
         dbg["dropped_common"] = ax.dropped_common
         dbg["stats_intent"] = stats_intent
-        dbg["uses_rerank"] = uses_rerank
-        dbg["primary_signal"] = "rerank" if uses_rerank else "dense"
-        dbg["primary_value"] = (round(primary_value, 4) if primary_value is not None else None)
-        dbg["primary_threshold"] = primary_threshold
         dbg["sem_top_sim"] = (round(sem_top_sim, 4) if sem_top_sim is not None else None)
         dbg["sem_accept_threshold"] = sem_accept_threshold
         dbg["qp_index_loaded"] = (retriever._index_qp is not None)  # type: ignore[attr-defined]
         dbg["top_candidates"] = [
-            {"idx": c.index, "fused": round(c.fused_score, 5),
+            {"idx": c.index, "lang": c.lang, "fused": round(c.fused_score, 5),
              "rerank": (round(c.rerank_score, 3) if c.rerank_score is not None else None),
              "dense": (round(c.dense_sim, 4) if c.dense_sim is not None else None),
-             "q": c.question[:140], "section": c.section[:140]}
+             "q": c.question[:120]}
             for c in candidates[:10]
         ]
 
     if not candidates:
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    bundle: Optional[List[RetrievalCandidate]] = None
+    thresholds = {
+        "sem_accept_threshold": sem_accept_threshold,
+        "rerank_accept_threshold": rerank_accept_threshold,
+        "dense_floor": dense_floor,
+    }
 
-    # -----------------------
-    # Stats questions: prefer a grounded statistic when the user asked for one.
-    # If none is found we fall through (never fabricating numbers).
-    # -----------------------
-    if stats_intent:
-        required_concepts = _stats_concept_stems_to_require(anchor_concepts, lang)
+    # Same-language first, cross-lingual fallback. In per-language mode every
+    # candidate already shares the query language, so `cross` is empty.
+    if getattr(retriever, "shared", False):
+        same = [c for c in candidates if c.lang == lang]
+        cross = [c for c in candidates if c.lang != lang]
+    else:
+        same, cross = candidates, []
+
+    notice = ""
+    bundle = _decide_bundle(retriever, same, lang, anchor_concepts, strong_anchors,
+                            stats_intent, thresholds, dbg, debug)
+
+    if bundle is None and cross:
+        cross_dbg: Dict[str, Any] = {}
+        cross_bundle = _decide_bundle(retriever, cross, lang, anchor_concepts, strong_anchors,
+                                      stats_intent, thresholds, cross_dbg, debug)
+        if cross_bundle is not None:
+            bundle = cross_bundle
+            notice = _crosslingual_notice(lang, bundle[0].lang)
+            if debug:
+                dbg["crosslingual_fallback"] = True
+                dbg["answer_lang"] = bundle[0].lang
+                dbg["cross_pass"] = cross_dbg
+
+    if not bundle:
         if debug:
-            dbg["stats_required_concepts"] = sorted(list(required_concepts))[:20]
+            dbg.setdefault("decision_path", "abstain")
+        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-        ok_stats_candidates: List[RetrievalCandidate] = []
-        for c in candidates:
-            text = f"{c.question} {c.section} {c.answer}"
-            if not _passes_stats_gate(text, lang):
-                continue
-            if required_concepts:
-                if not _anchor_overlap_concepts(text, required_concepts, lang):
-                    continue
-            ok_stats_candidates.append(c)
-
-        if debug:
-            dbg["stats_gate_candidates"] = [{"idx": c.index, "q": c.question[:120]} for c in ok_stats_candidates[:10]]
-
-        if ok_stats_candidates:
-            best = sorted(ok_stats_candidates, key=_score_candidate, reverse=True)[0]
-            bundle = [best]
-            if debug:
-                dbg["decision_path"] = "stats"
-        elif debug:
-            dbg["stats_fell_through"] = True
-
-    if bundle is None:
-        # -----------------------
-        # Semantic-first accept decision.
-        # -----------------------
-        primary_ok = (primary_value is not None) and (primary_value >= primary_threshold)
-
-        # Lexical safety net: a candidate that covers a high-IDF anchor and is
-        # at least modestly similar. dense_sim is used because it is a stable
-        # [-1, 1] cosine regardless of whether reranking is on.
-        lexical_lead: Optional[RetrievalCandidate] = None
-        if strong_anchors:
-            for c in sorted(candidates, key=_score_candidate, reverse=True):
-                text = f"{c.question} {c.section} {c.answer}"
-                if not _anchor_overlap_concepts(text, strong_anchors, lang):
-                    continue
-                if c.dense_sim is not None and c.dense_sim < dense_floor:
-                    continue
-                lexical_lead = c
-                break
-
-        if not (primary_ok or lexical_lead is not None):
-            if debug:
-                dbg["decision_path"] = "abstain"
-            return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
-
-        # Choose the lead: prefer the primary (most relevant) candidate.
-        lead = top_primary if primary_ok else lexical_lead
-        if debug:
-            dbg["decision_path"] = "semantic_primary" if primary_ok else "lexical_net"
-
-        # Bundle assembly: only independently-relevant candidates may join, so a
-        # strong lead is never padded with low-relevance entries. Coverage over
-        # the anchors pulls in genuinely distinct concepts (multi-part answers).
-        def _member_ok(c: RetrievalCandidate) -> bool:
-            v = _primary_relevance(c, uses_rerank)
-            if v is None:
-                return False
-            return v >= primary_threshold
-
-        relevant_pool = [c for c in candidates if _member_ok(c)]
-        if lead is not None and lead not in relevant_pool:
-            relevant_pool = [lead] + relevant_pool
-
-        if anchor_concepts:
-            bundle, cov_details = _select_bundle_with_coverage(
-                relevant_pool, lang, anchor_concepts, max_n=3
-            )
-            if debug:
-                dbg["coverage_gate"] = cov_details
-        else:
-            bundle = []
-
-        # Guarantee the lead is present and first.
-        if lead is not None:
-            bundle = [lead] + [c for c in bundle if c.index != lead.index]
-        if not bundle and lead is not None:
-            bundle = [lead]
-
-        if not bundle:
-            if debug:
-                dbg["decision_path"] = "abstain"
-            return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
-
-    # Build FAQ answer
+    # Build FAQ answer. Labels/preface are in the QUERY language; the FAQ content
+    # itself is quoted verbatim (which for a cross-lingual fallback is the other
+    # language -- the notice above tells the reader).
     faq_body = _format_bundle_body(lang, bundle)
     sources = _format_sources(lang, bundle)
     factual_block = _format_full_answer(lang, faq_body, sources)
 
-    # Empathy prefix (only when answering)
     if use_llm:
         wrapper = LLMWrapperWriter(language=lang, model=llm_model).write(user_query=user_query).strip()
         prefix = (wrapper + "\n\n") if wrapper else _fallback_empathy(lang, user_query, bundle[0].question)
@@ -1320,7 +1399,8 @@ def answer_query(
     else:
         prefix = _fallback_empathy(lang, user_query, bundle[0].question)
 
-    answer_text = (prefix + factual_block).strip()
+    notice_block = (notice + "\n\n") if notice else ""
+    answer_text = (prefix + notice_block + factual_block).strip()
 
     top = bundle[0]
     return AnswerResult(
@@ -1341,7 +1421,10 @@ def print_debug(result: AnswerResult) -> None:
     if not result.debug:
         return
 
-    print("\n[DEBUG] anchors:", result.debug.get("anchors"))
+    print("\n[DEBUG] query_lang:", result.debug.get("query_lang"),
+          "| shared_mode:", result.debug.get("shared_mode"),
+          "| crosslingual_fallback:", result.debug.get("crosslingual_fallback", False))
+    print("[DEBUG] anchors:", result.debug.get("anchors"))
     print("[DEBUG] strong_anchors:", result.debug.get("strong_anchors"))
     print("[DEBUG] present_concepts (idf,df):", result.debug.get("present_concepts"))
     print("[DEBUG] dropped_absent:", result.debug.get("absent_concepts"))

@@ -472,6 +472,12 @@ def main() -> None:
                     help="Prefix rag_core prepends to the query (e.g. 'query: ' for e5). Stored in payload.")
     ap.add_argument("--chunk-size", type=int, default=250, help="Article chunk size in words.")
     ap.add_argument("--chunk-overlap", type=int, default=40, help="Article chunk overlap in words.")
+    ap.add_argument("--shared", action=argparse.BooleanOptionalAction, default=True,
+                    help="Also build a combined '<prefix>_all_*' index across all languages "
+                         "(shared multilingual space, each item lang-tagged) for cross-lingual "
+                         "fallback. Default: on. Disable with --no-shared.")
+    ap.add_argument("--per-language", action=argparse.BooleanOptionalAction, default=True,
+                    help="Also build the per-language '<prefix>_<lang>_*' indexes. Default: on.")
     args = ap.parse_args()
 
     sources = load_sources(args)
@@ -480,13 +486,29 @@ def main() -> None:
 
     print("Collecting items...")
     by_lang = collect_items(sources, args)
+    meta = {"chunk_size": args.chunk_size, "chunk_overlap": args.chunk_overlap}
 
-    for lang, items in by_lang.items():
+    if args.per_language:
+        for lang, items in by_lang.items():
+            build_and_save(
+                items=items, lang=lang, data_dir=args.data_dir, out_prefix=args.out_prefix,
+                embedding_model=args.embedding_model,
+                passage_prefix=args.passage_prefix, query_prefix=args.query_prefix,
+                manifest_meta=meta,
+            )
+
+    # Combined shared-space index across every language. Items keep their own
+    # per-item "lang" tag; the retriever prefers same-language and falls back
+    # cross-lingual. Written as '<prefix>_all_*' (lang bucket name = "all").
+    if args.shared:
+        combined: List[Dict[str, Any]] = []
+        for lang in sorted(by_lang):
+            combined.extend(by_lang[lang])
         build_and_save(
-            items=items, lang=lang, data_dir=args.data_dir, out_prefix=args.out_prefix,
+            items=combined, lang="all", data_dir=args.data_dir, out_prefix=args.out_prefix,
             embedding_model=args.embedding_model,
             passage_prefix=args.passage_prefix, query_prefix=args.query_prefix,
-            manifest_meta={"chunk_size": args.chunk_size, "chunk_overlap": args.chunk_overlap},
+            manifest_meta={**meta, "languages": sorted(by_lang)},
         )
     print("Done.")
 

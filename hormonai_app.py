@@ -466,7 +466,7 @@ Discutez toujours de votre situation et de toute décision thérapeutique direct
         "⚠️ hormonAI ne remplace pas votre équipe d’oncologie et ne peut pas "
         "donner de recommandations personnalisées sur les traitements."
     )
-    chat_title_label = "Discuter avec hormonAI"
+    chat_title_label = "Discuter avec Mona"
     placeholder = "Par exemple : « Les bouffées de chaleur sont-elles fréquentes ? »"
     prompt_label = "Posez votre question sur l’hormonothérapie adjuvante…"
     use_llm_label = "Utiliser un LLM pour reformuler (avancé)"
@@ -508,7 +508,7 @@ Always discuss your situation and any treatment decisions directly with your onc
         "⚠️ hormonAI does not replace your oncology team and cannot give "
         "individual treatment recommendations."
     )
-    chat_title_label = "Chat with hormonAI"
+    chat_title_label = "Chat with Mona"
     placeholder = 'For example: "Is sun exposure contraindicated while taking tamoxifen?"'
     prompt_label = "Ask your question about adjuvant hormone therapy…"
     use_llm_label = "Use LLM for rephrasing (advanced)"
@@ -569,16 +569,33 @@ st.sidebar.caption(sidebar_reminder)
 
 # ---------- RETRIEVER CACHING ----------
 @st.cache_resource
-def load_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
+def load_shared_retriever(rerank: bool) -> HybridFAQRetriever:
+    # Combined multilingual index (faq_all_*): one shared embedding space,
+    # same-language preferred, cross-lingual fallback. Query language is set
+    # per request below.
+    r = HybridFAQRetriever(language="en", rerank=rerank, shared=True)
+    r.load()
+    return r
+
+@st.cache_resource
+def load_perlang_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
     r = HybridFAQRetriever(language=lang, rerank=rerank)
     r.load()
     return r
 
+retriever = None
+retrieval_mode = "shared"
 try:
-    retriever = load_retriever(language, use_rerank)
-except Exception as e:
-    st.error(f"Error loading FAQ data for language '{language}': {e}")
-    st.stop()
+    retriever = load_shared_retriever(use_rerank)
+    retriever.language = language  # active query language on the shared corpus
+except Exception:
+    # faq_all_* not built (or unreadable): fall back to per-language indexes.
+    retrieval_mode = "per-language"
+    try:
+        retriever = load_perlang_retriever(language, use_rerank)
+    except Exception as e:
+        st.error(f"Error loading FAQ data for language '{language}': {e}")
+        st.stop()
 
 # ---------- SESSION STATE ----------
 if "history" not in st.session_state:
@@ -706,7 +723,7 @@ with chat_container:
             safe_text = render_bubble_text(msg["content"])
             bot_html = f"""
             <div class="chat-bubble-bot">
-                <div class="chat-role">hormonAI</div>
+                <div class="chat-role">Mona</div>
                 <div class="chat-content">{safe_text}</div>
             </div>
             """
