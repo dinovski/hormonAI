@@ -553,8 +553,8 @@ def main() -> None:
     ap.add_argument("--language", "-l", choices=["en", "fr"], default="en",
                     help="Language for --faq/--article convenience flags.")
     ap.add_argument("--data-dir", default="data")
-    ap.add_argument("--out-prefix", default="faq",
-                    help="Output basename; rag_core loads '<prefix>_<lang>_*'. Default: faq.")
+    ap.add_argument("--out-prefix", default="kb",
+                    help="Output basename; rag_core loads '<prefix>_<lang>_*' and '<prefix>_all_*'. Default: kb.")
     ap.add_argument("--embedding-model",
                     default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
     ap.add_argument("--passage-prefix", default="",

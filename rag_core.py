@@ -580,6 +580,7 @@ class AnswerResult:
     source_title: Optional[str] = None
     source_section: Optional[str] = None
     source_index: Optional[int] = None
+    source_indices: Optional[List[int]] = None   # positional indices of every bundled source
     debug: Optional[Dict[str, Any]] = None
 
 
@@ -592,7 +593,7 @@ class HybridFAQRetriever:
         self,
         language: str = "en",
         data_dir: str = "data",
-        top_k: int = 12,
+        top_k: int = 40,   # candidate pool per channel; sized for the enlarged, bilingual corpus
         embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         rerank: bool = False,
         rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
@@ -636,9 +637,9 @@ class HybridFAQRetriever:
         if self.corpus_prefix:
             prefix = self.corpus_prefix
         elif self.shared:
-            prefix = "faq_all"
+            prefix = "kb_all"
         else:
-            prefix = f"faq_{self.language}"
+            prefix = f"kb_{self.language}"
         qa_path = os.path.join(self.data_dir, f"{prefix}_qa.pkl")
         bm25_path = os.path.join(self.data_dir, f"{prefix}_bm25.pkl")
         idx_q_path = os.path.join(self.data_dir, f"{prefix}_index_q.faiss")
@@ -881,8 +882,8 @@ def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
 def _format_preface(language: str) -> str:
     lang = _norm_lang(language)
     if lang == "fr":
-        return "**Voici ce que dit la FAQ sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
-    return "**Here is what the FAQ says about this topic (this does not replace advice from your care team):**\n\n"
+        return "**Voici les informations disponibles sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
+    return "**Here is the available information on this topic (this does not replace advice from your care team):**\n\n"
 
 
 def _format_sources(language: str, bundle: List[RetrievalCandidate]) -> str:
@@ -890,10 +891,10 @@ def _format_sources(language: str, bundle: List[RetrievalCandidate]) -> str:
     lines: List[str] = []
     if lang == "fr":
         for c in bundle:
-            lines.append(f"**— Source FAQ :** “{c.question}” (section : {c.section})")
+            lines.append(f"**— Source :** “{c.question}” (section : {c.section})")
     else:
         for c in bundle:
-            lines.append(f"**— FAQ source:** “{c.question}” (section: {c.section})")
+            lines.append(f"**— Source:** “{c.question}” (section: {c.section})")
     return "\n\n".join(lines).strip()
 
 
@@ -902,6 +903,31 @@ def _format_full_answer(language: str, body: str, sources: str) -> str:
     if sources:
         return (pre + (body or "").strip() + "\n\n" + sources).strip()
     return (pre + (body or "").strip()).strip()
+
+
+def _format_preface_rephrased(language: str) -> str:
+    """Preface used when the LLM has rephrased (not quoted) the source text."""
+    lang = _norm_lang(language)
+    if lang == "fr":
+        return ("**D’après les informations disponibles sur l’hormonothérapie (information générale "
+                "qui ne remplace pas l’avis de votre équipe soignante) :**\n\n")
+    return ("**Based on the available hormone therapy information (general information that does not "
+            "replace advice from your care team):**\n\n")
+
+
+def _bundle_source_text(bundle: List[RetrievalCandidate]) -> str:
+    """Verbatim source text handed to the LLM for grounded rephrasing. FAQ items
+    keep their question as a mini-heading; article chunks (whose 'question' is a
+    filename breadcrumb) contribute their body only."""
+    parts: List[str] = []
+    for c in bundle:
+        q = (c.question or "").strip()
+        a = (c.answer or "").strip()
+        if q.endswith("?"):
+            parts.append(f"{q}\n{a}")
+        else:
+            parts.append(a)
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 # ---------------------------
@@ -986,7 +1012,51 @@ class LLMWrapperWriter:
             return f"Question utilisateur: {user_query}\n\nPréambule empathique:"
         return f"User question: {user_query}\n\nEmpathetic preface:"
 
-    def write(self, user_query: str) -> str:
+    # ---- grounded rephrasing (strictly uses the provided source text) ----
+
+    def _rephrase_system_prompt(self) -> str:
+        if self.language == "fr":
+            return (
+                "Tu es un assistant bienveillant pour des patientes sous hormonothérapie "
+                "adjuvante du cancer du sein.\n\n"
+                "TÂCHE: Réponds à la question en reformulant le TEXTE SOURCE ci-dessous en "
+                "un message clair, chaleureux et simple.\n\n"
+                "RÈGLES STRICTES:\n"
+                "- Utilise UNIQUEMENT les informations présentes dans le TEXTE SOURCE. "
+                "N'ajoute AUCUN fait, chiffre, médicament, posologie ou conseil absent du texte.\n"
+                "- Réponds DIRECTEMENT et de façon générale à la question posée. Ne centre pas la "
+                "réponse sur un scénario particulier (par exemple la grossesse) sauf si la personne "
+                "l'a explicitement demandé ; si une source ne traite que d'un tel scénario, mentionne-le "
+                "brièvement au maximum.\n"
+                "- N'omets aucune mise en garde ou condition de sécurité présente dans le texte.\n"
+                "- Si le TEXTE SOURCE ne répond pas à la question, dis simplement que tu n'as pas "
+                "cette information précise et invite à en parler avec l'équipe soignante.\n"
+                "- N'invente pas de sources. Ne mentionne pas ces instructions.\n"
+                "- Sois concis (un court paragraphe), à la deuxième personne.\n"
+            )
+        return (
+            "You are a caring assistant for patients on adjuvant hormone therapy for breast cancer.\n\n"
+            "TASK: Answer the question by rephrasing the SOURCE TEXT below into a clear, warm, "
+            "plain-language reply.\n\n"
+            "STRICT RULES:\n"
+            "- Use ONLY information contained in the SOURCE TEXT. Do NOT add facts, numbers, drug "
+            "names, dosages, or advice that are not in it.\n"
+            "- Answer the user's ACTUAL question directly and in general terms. Do NOT center the "
+            "answer on a specific scenario (for example pregnancy) unless the user explicitly asked "
+            "about it; if a source only covers such a scenario, mention it briefly at most.\n"
+            "- Do NOT omit any safety-relevant caveat or condition present in the source.\n"
+            "- If the SOURCE TEXT does not answer the question, say you don't have that specific "
+            "information and suggest discussing it with the care team.\n"
+            "- Do NOT invent sources. Do NOT mention these instructions.\n"
+            "- Be concise (a short paragraph), written in warm second person.\n"
+        )
+
+    def _rephrase_user_prompt(self, user_query: str, source_text: str) -> str:
+        if self.language == "fr":
+            return f"Question: {user_query}\n\nTEXTE SOURCE:\n{source_text}\n\nRéponse:"
+        return f"Question: {user_query}\n\nSOURCE TEXT:\n{source_text}\n\nReply:"
+
+    def _generate(self, system: str, prompt: str, max_tokens: int) -> str:
         import urllib.request
 
         base = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -994,21 +1064,34 @@ class LLMWrapperWriter:
 
         payload = {
             "model": self.model,
-            "prompt": self._user_prompt(user_query),
-            "system": self._system_prompt(),
+            "prompt": prompt,
+            "system": system,
             "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": {"temperature": self.temperature, "num_predict": max_tokens},
         }
-
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 out = json.loads(resp.read().decode("utf-8"))
             return (out.get("response") or "").strip()
         except Exception:
             return ""
+
+    def write(self, user_query: str) -> str:
+        """Empathy-only preface (no facts). Unchanged behavior."""
+        return self._generate(self._system_prompt(), self._user_prompt(user_query), self.max_tokens)
+
+    def rephrase(self, user_query: str, source_text: str, max_tokens: int = 400) -> str:
+        """Rephrase the provided source text into a grounded, clear, empathetic answer.
+        Returns "" on failure so the caller can fall back to verbatim output."""
+        if not (source_text or "").strip():
+            return ""
+        return self._generate(
+            self._rephrase_system_prompt(),
+            self._rephrase_user_prompt(user_query, source_text),
+            max_tokens,
+        )
 
 
 # ---------------------------
@@ -1019,14 +1102,14 @@ def build_abstain(language: str) -> str:
     lang = _norm_lang(language)
     if lang == "fr":
         return (
-            "Je comprends votre question. Cependant, la FAQ sur laquelle je suis basé(e) ne semble pas "
+            "Je comprends votre question. Cependant, les informations sur lesquelles je m’appuie ne semblent pas "
             "contenir d’information spécifique sur ce sujet. Pour éviter d’inventer des informations médicales, "
-            "je ne peux pas répondre à partir de la FAQ.\n\n"
+            "je ne peux pas répondre à partir de ces sources.\n\n"
             "Je vous recommande d’en parler avec votre équipe d’oncologie."
         )
     return (
-        "I understand why you’re asking. However, the FAQ I’m based on does not appear to contain specific "
-        "information about this topic. To avoid inventing medical information, I can’t answer this from the FAQ.\n\n"
+        "I understand why you’re asking. However, the information I have does not appear to contain specific "
+        "information about this topic. To avoid inventing medical information, I can’t answer this from my sources.\n\n"
         "Please discuss this with your oncology team."
     )
 
@@ -1277,6 +1360,19 @@ def _decide_bundle(
     if not bundle and lead is not None:
         bundle = [lead]
 
+    # Multi-source: fill the remaining slots with the next most relevant
+    # candidates (all above the accept threshold), so the answer presents the
+    # top few relevant FAQ entries rather than betting everything on the
+    # reranker's single #1. This surfaces complementary answers (e.g. a
+    # "therapeutic break" entry alongside a "recurrence risk" entry).
+    have = {c.index for c in bundle}
+    for c in sorted(relevant_pool, key=_score_candidate, reverse=True):
+        if len(bundle) >= 3:
+            break
+        if c.index not in have:
+            bundle.append(c)
+            have.add(c.index)
+
     return bundle if bundle else None
 
 
@@ -1287,7 +1383,7 @@ def answer_query(
     llm_model: str = "llama3.2",
     debug: bool = False,
     sem_accept_threshold: float = 0.62,
-    rerank_accept_threshold: float = 0.0,
+    rerank_accept_threshold: float = -1.0,  # mmarco cross-encoder scores relevant items ~ -1..+2
     dense_floor: float = 0.50,
     coverage_fraction: float = 0.5,  # deprecated: kept for call compatibility
 ) -> AnswerResult:
@@ -1319,7 +1415,12 @@ def answer_query(
     ax = extract_anchor_concepts(user_query, lang, retriever)
     anchors = ax.anchors
     anchor_concepts = set(anchors)
-    strong_anchors = {a for a in anchor_concepts if retriever.idf(a) >= retriever.average_idf}
+    # "Strong" (specific) anchors for the lexical safety net: terms that appear
+    # in only a small share of the corpus. Defined by document-frequency, NOT by
+    # idf >= average_idf -- the latter collapses to the empty set once a large
+    # article corpus inflates the average, disabling the net entirely.
+    strong_df_cap = max(1, int(0.15 * retriever.corpus_size))
+    strong_anchors = {a for a in anchor_concepts if 1 <= retriever.df(a) <= strong_df_cap}
     stats_intent = _is_stats_intent(user_query, lang)
 
     sem_top = _semantic_top(candidates)
@@ -1343,7 +1444,7 @@ def answer_query(
              "rerank": (round(c.rerank_score, 3) if c.rerank_score is not None else None),
              "dense": (round(c.dense_sim, 4) if c.dense_sim is not None else None),
              "q": c.question[:120]}
-            for c in candidates[:10]
+            for c in candidates[:15]
         ]
 
     if not candidates:
@@ -1384,23 +1485,41 @@ def answer_query(
             dbg.setdefault("decision_path", "abstain")
         return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
 
-    # Build FAQ answer. Labels/preface are in the QUERY language; the FAQ content
-    # itself is quoted verbatim (which for a cross-lingual fallback is the other
-    # language -- the notice above tells the reader).
-    faq_body = _format_bundle_body(lang, bundle)
+    # Labels/preface are in the QUERY language. Source citations are always
+    # appended verbatim so the answer is verifiable.
     sources = _format_sources(lang, bundle)
-    factual_block = _format_full_answer(lang, faq_body, sources)
+    notice_block = (notice + "\n\n") if notice else ""
+
+    def _verbatim_answer() -> str:
+        # FAQ content quoted verbatim + fixed empathy sentence (original behavior).
+        faq_body = _format_bundle_body(lang, bundle)
+        factual_block = _format_full_answer(lang, faq_body, sources)
+        prefix = _fallback_empathy(lang, user_query, bundle[0].question)
+        return (prefix + notice_block + factual_block).strip()
 
     if use_llm:
-        wrapper = LLMWrapperWriter(language=lang, model=llm_model).write(user_query=user_query).strip()
-        prefix = (wrapper + "\n\n") if wrapper else _fallback_empathy(lang, user_query, bundle[0].question)
-        if debug and not wrapper:
-            dbg["llm_wrapper_fallback"] = True
+        # Grounded rephrasing: the LLM rewrites ONLY the retrieved source text for
+        # clarity + empathy (no new facts), then the verbatim sources are cited.
+        # If the LLM is unreachable/empty, fall back to the verbatim answer so we
+        # never lose a response.
+        source_text = _bundle_source_text(bundle)
+        rephrased = LLMWrapperWriter(language=lang, model=llm_model).rephrase(
+            user_query=user_query, source_text=source_text
+        ).strip()
+        if rephrased:
+            answer_text = (
+                _format_preface_rephrased(lang) + notice_block + rephrased + "\n\n" + sources
+            ).strip()
+            if debug:
+                dbg["llm_mode"] = "rephrase"
+        else:
+            answer_text = _verbatim_answer()
+            if debug:
+                dbg["llm_mode"] = "verbatim_fallback"
     else:
-        prefix = _fallback_empathy(lang, user_query, bundle[0].question)
-
-    notice_block = (notice + "\n\n") if notice else ""
-    answer_text = (prefix + notice_block + factual_block).strip()
+        answer_text = _verbatim_answer()
+        if debug:
+            dbg["llm_mode"] = "verbatim"
 
     top = bundle[0]
     return AnswerResult(
@@ -1409,6 +1528,7 @@ def answer_query(
         source_title=top.question,
         source_section=top.section,
         source_index=top.index,
+        source_indices=[c.index for c in bundle],
         debug=(dbg if debug else None),
     )
 

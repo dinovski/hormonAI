@@ -5,9 +5,10 @@ chatbot.py
 CLI for hormonAI.
 
 Key rules:
-- Retrieval is FAQ-only.
-- LLM (if enabled) is used ONLY for a short empathetic wrapper (no facts).
-- Answers always quote the FAQ content (no added medical facts).
+- Retrieval is restricted to the knowledge base (FAQs + articles).
+- LLM (if enabled) rephrases ONLY the retrieved source text (no added facts).
+- Answers are grounded strictly in the retrieved sources (verbatim or grounded
+  rephrase), with sources always cited.
 """
 
 from __future__ import annotations
@@ -20,10 +21,10 @@ from audit_logger import AuditLogger
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="hormonAI CLI chatbot (FAQ-restricted RAG).")
+    p = argparse.ArgumentParser(description="hormonAI CLI chatbot (knowledge-base-restricted RAG).")
     p.add_argument("--language", "-l", choices=["en", "fr"], default="en")
     p.add_argument("--data-dir", default="data")
-    p.add_argument("--top-k", type=int, default=12)
+    p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--embedding-model",
                    default=os.getenv("HORMONAI_EMBEDDING_MODEL",
                                      "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"),
@@ -34,7 +35,9 @@ def parse_args() -> argparse.Namespace:
     # The cross-encoder loads lazily and degrades gracefully if unavailable.
     p.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True,
                    help="CrossEncoder reranking (better ordering, slower). Default: on. Disable with --no-rerank.")
-    p.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+    p.add_argument("--rerank-model",
+                   default=os.getenv("HORMONAI_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"),
+                   help="Cross-encoder reranker (e.g. BAAI/bge-reranker-v2-m3 for stronger multilingual ranking).")
 
     # Shared multilingual index (faq_all_*): same-language preferred, cross-lingual
     # fallback. --language then selects the active QUERY language. Default: off
@@ -46,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     # Semantic-first: rerank score is primary when --rerank is on, else dense cosine.
     p.add_argument("--sem-threshold", type=float, default=0.62,
                    help="Dense cosine accept threshold when reranking is OFF (default: 0.62).")
-    p.add_argument("--rerank-threshold", type=float, default=0.0,
-                   help="Cross-encoder accept threshold when reranking is ON (default: 0.0).")
+    p.add_argument("--rerank-threshold", type=float, default=-1.0,
+                   help="Cross-encoder accept threshold when reranking is ON (default: -1.0; calibrate on eval set).")
     p.add_argument("--dense-floor", type=float, default=0.50,
                    help="Permissive cosine floor for the high-IDF lexical safety net (default: 0.50).")
 
@@ -63,7 +66,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    print(f"Loading FAQ retriever for LANGUAGE = {args.language}...")
+    print(f"Loading retriever for LANGUAGE = {args.language}...")
     retriever = HybridFAQRetriever(
         language=args.language,
         data_dir=args.data_dir,
@@ -78,10 +81,10 @@ def main() -> None:
     logger = AuditLogger(args.audit_log)
 
     if args.language == "fr":
-        print("Chatbot prêt (FAQ hormonothérapie adjuvante).")
+        print("Chatbot prêt (base de connaissances hormonothérapie adjuvante).")
         print("Tapez 'exit' ou 'quit' pour quitter.\n")
     else:
-        print("Chatbot ready (adjuvant hormone therapy FAQ).")
+        print("Chatbot ready (adjuvant hormone therapy knowledge base).")
         print("Type 'exit' or 'quit' to leave.\n")
 
     while True:

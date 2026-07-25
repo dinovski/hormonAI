@@ -62,13 +62,19 @@ def main() -> int:
     ap.add_argument("--eval-set", default=os.path.join(os.path.dirname(__file__), "eval_set.jsonl"))
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--lang", choices=["en", "fr"], default=None, help="Restrict to one language.")
-    ap.add_argument("--top-k", type=int, default=12)
-    ap.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+    ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--embedding-model",
+                    default=os.getenv("HORMONAI_EMBEDDING_MODEL",
+                                      "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"),
+                    help="Must match the model used at ingestion (e.g. BAAI/bge-m3).")
+    ap.add_argument("--shared", action="store_true",
+                    help="Evaluate the combined faq_all_* index (same-language-first + cross-lingual fallback).")
     ap.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+    ap.add_argument("--rerank-model",
+                    default=os.getenv("HORMONAI_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"))
     ap.add_argument("--sem-threshold", type=float, default=0.62,
                     help="Dense cosine accept threshold (reranking OFF).")
-    ap.add_argument("--rerank-threshold", type=float, default=0.0,
+    ap.add_argument("--rerank-threshold", type=float, default=-1.0,
                     help="Cross-encoder accept threshold (reranking ON).")
     ap.add_argument("--dense-floor", type=float, default=0.50,
                     help="Cosine floor for the high-IDF lexical safety net.")
@@ -83,25 +89,47 @@ def main() -> int:
 
     langs = sorted({c["lang"] for c in cases})
     retrievers: Dict[str, HybridFAQRetriever] = {}
-    for lang in langs:
-        print(f"Loading retriever [{lang}] (rerank={args.rerank})...")
-        r = HybridFAQRetriever(
-            language=lang,
-            data_dir=args.data_dir,
-            top_k=args.top_k,
-            embedding_model=args.embedding_model,
-            rerank=args.rerank,
-            rerank_model=args.rerank_model,
+    if args.shared:
+        # One combined index serves every language; query language is set per case.
+        print(f"Loading SHARED retriever faq_all_* (rerank={args.rerank})...")
+        shared = HybridFAQRetriever(
+            language="en", data_dir=args.data_dir, top_k=args.top_k,
+            embedding_model=args.embedding_model, rerank=args.rerank,
+            rerank_model=args.rerank_model, shared=True,
         )
-        r.load()
-        retrievers[lang] = r
+        shared.load()
+        for lang in langs:
+            retrievers[lang] = shared
+    else:
+        for lang in langs:
+            print(f"Loading retriever [{lang}] (rerank={args.rerank})...")
+            r = HybridFAQRetriever(
+                language=lang,
+                data_dir=args.data_dir,
+                top_k=args.top_k,
+                embedding_model=args.embedding_model,
+                rerank=args.rerank,
+                rerank_model=args.rerank_model,
+            )
+            r.load()
+            retrievers[lang] = r
 
     results: List[Dict[str, Any]] = []
     for c in cases:
         r = retrievers[c["lang"]]
+        r.language = c["lang"]  # active query language (matters in shared mode)
+
+        # Map positional indices -> stable item ids (works in per-language AND
+        # shared mode, since the id lives on the item regardless of position).
+        def _id_at(pos):
+            try:
+                return str(r._items[int(pos)].get("id", ""))
+            except Exception:
+                return ""
+
         cands = r.retrieve(c["query"])
-        retrieved_idx = [int(x.index) for x in cands]
-        gold = set(int(g) for g in c.get("gold_idx", []))
+        retrieved_ids = {_id_at(x.index) for x in cands}
+        gold = set(c.get("gold_ids", []))
 
         res = answer_query(
             retriever=r,
@@ -113,9 +141,14 @@ def main() -> int:
             dense_floor=args.dense_floor,
         )
 
-        recall_hit = bool(gold & set(retrieved_idx)) if gold else None
+        lead_id = _id_at(res.source_index) if res.answered else None
+        bundle_ids = {_id_at(i) for i in (res.source_indices or [])}
+
+        recall_hit = bool(gold & retrieved_ids) if gold else None
         decision_ok = (res.answered == c["expected_answerable"])
-        lead_correct = (res.source_index in gold) if (res.answered and gold) else None
+        # Did the ANSWER lead with a gold source? / include any gold source?
+        lead_correct = (lead_id in gold) if (res.answered and gold) else None
+        source_in_bundle = bool(gold & bundle_ids) if (res.answered and gold) else None
 
         row = {
             "id": c["id"],
@@ -128,8 +161,9 @@ def main() -> int:
             "decision_ok": decision_ok,
             "recall_hit": recall_hit,
             "lead_correct": lead_correct,
-            "lead_source_index": res.source_index,
-            "gold_idx": sorted(gold),
+            "source_in_bundle": source_in_bundle,
+            "lead_id": lead_id,
+            "gold_ids": sorted(gold),
             "decision_path": (res.debug or {}).get("decision_path"),
             "sem_top_sim": (res.debug or {}).get("sem_top_sim"),
             "present_concepts": (res.debug or {}).get("present_concepts"),
@@ -139,8 +173,8 @@ def main() -> int:
         if args.verbose:
             flag = "OK " if decision_ok else "XX "
             print(f"{flag}[{c['id']}] answered={res.answered} exp={c['expected_answerable']} "
-                  f"path={row['decision_path']} sim={row['sem_top_sim']} recall={recall_hit} "
-                  f"lead={res.source_index} gold={sorted(gold)}")
+                  f"path={row['decision_path']} recall={recall_hit} lead_ok={lead_correct} "
+                  f"in_bundle={source_in_bundle} lead={lead_id}")
 
     core = [r for r in results if args.include_hard or not r["hard"]]
     hard = [r for r in results if r["hard"]]
@@ -158,11 +192,14 @@ def main() -> int:
         recall_hits = sum(1 for r in recall_cases if r["recall_hit"])
         lead_cases = [r for r in rows if r["lead_correct"] is not None]
         lead_hits = sum(1 for r in lead_cases if r["lead_correct"])
+        bundle_cases = [r for r in rows if r["source_in_bundle"] is not None]
+        bundle_hits = sum(1 for r in bundle_cases if r["source_in_bundle"])
 
         print(f"\n===== {title} (n={n}) =====")
         print(f"  Decision accuracy (answered==expected) : {dec_ok}/{n}  {pct(dec_ok, n)}")
         print(f"  Retrieval recall@{args.top_k} (gold in candidates): {recall_hits}/{len(recall_cases)}  {pct(recall_hits, len(recall_cases))}")
-        print(f"  Lead-source correctness (top src is gold): {lead_hits}/{len(lead_cases)}  {pct(lead_hits, len(lead_cases))}")
+        print(f"  Lead-source correctness (headline src is gold): {lead_hits}/{len(lead_cases)}  {pct(lead_hits, len(lead_cases))}")
+        print(f"  Gold source anywhere in answer bundle         : {bundle_hits}/{len(bundle_cases)}  {pct(bundle_hits, len(bundle_cases))}")
         print(f"  FALSE-ABSTENTION (answerable wrongly refused): {false_abstain}/{len(ans_cases)}  {pct(false_abstain, len(ans_cases))}")
         print(f"  FALSE-ANSWER (out-of-scope wrongly answered) : {false_answer}/{len(oos_cases)}  {pct(false_answer, len(oos_cases))}")
 

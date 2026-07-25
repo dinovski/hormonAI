@@ -22,6 +22,16 @@ DEFAULT_EMBEDDING_MODEL = os.getenv(
     "HORMONAI_EMBEDDING_MODEL",
     "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
 )
+# Accept/abstain thresholds. Defaults are conservative starting points and are
+# model-specific -- calibrate on the gold eval set and set these env vars so the
+# GUI uses the calibrated values (see README / RETRIEVAL_REVIEW.md).
+# Reranker model. Upgrade to a stronger multilingual cross-encoder (e.g.
+# BAAI/bge-reranker-v2-m3, which pairs with BGE-M3) by setting this env var.
+# Changing it requires re-calibrating HORMONAI_RERANK_THRESHOLD (different scale).
+DEFAULT_RERANK_MODEL = os.getenv("HORMONAI_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+RERANK_ACCEPT_THRESHOLD = float(os.getenv("HORMONAI_RERANK_THRESHOLD", "-1.0"))
+SEM_ACCEPT_THRESHOLD = float(os.getenv("HORMONAI_SEM_THRESHOLD", "0.62"))
+DENSE_FLOOR = float(os.getenv("HORMONAI_DENSE_FLOOR", "0.50"))
 
 
 # ---------- SAMPLE PROMPTS (from patient-forum research) ----------
@@ -453,15 +463,15 @@ if language == "fr":
 
 **Qu’est-ce que hormonAI ?**
 
-- hormonAI est un *prototype* de chatbot construit à partir d’une FAQ écrite sur l’hormonothérapie adjuvante du cancer du sein.
-- Il utilise une approche de recherche augmentée par génération (RAG) : pour chaque question, il cherche dans la FAQ et s’appuie sur les entrées les plus pertinentes.
+- hormonAI est un *prototype* de chatbot construit à partir d’une base de connaissances (articles et FAQ) sur l’hormonothérapie adjuvante du cancer du sein.
+- Il utilise une approche de recherche augmentée par génération (RAG) : pour chaque question, il cherche dans la base de connaissances et s’appuie sur les entrées les plus pertinentes.
 
 **Points de sécurité très importants**
 
 - hormonAI ne remplace **en aucun cas** votre oncologue, votre médecin traitant ou votre équipe soignante.
 - Ce n’est **pas** un service d’urgence et il ne fournit pas de conseils médicaux personnalisés.
 - Il ne doit jamais être utilisé pour décider de commencer, arrêter ou modifier un traitement.
-- hormonAI est limité au contenu de la FAQ et peut répondre « Je ne sais pas » lorsque la question dépasse ce cadre.
+- hormonAI est limité au contenu de sa base de connaissances et peut répondre « Je ne sais pas » lorsque la question dépasse ce cadre.
 
 Discutez toujours de votre situation et de toute décision thérapeutique directement avec votre équipe d’oncologie.
 
@@ -477,10 +487,10 @@ Discutez toujours de votre situation et de toute décision thérapeutique direct
     prompt_label = "Posez votre question sur l’hormonothérapie adjuvante…"
     use_llm_label = "Utiliser un LLM pour reformuler (avancé)"
     use_llm_help = (
-        "Si désactivé, hormonAI répond directement avec le texte de la FAQ.\n"
-        "Si activé, le LLM reformule uniquement lorsque la réponse est trouvée dans la FAQ."
+        "Si désactivé, hormonAI répond directement avec le texte source.\n"
+        "Si activé, le LLM reformule uniquement lorsque la réponse est trouvée dans la base de connaissances."
     )
-    show_sources_label = "Afficher les sources de la FAQ pour chaque réponse"
+    show_sources_label = "Afficher les sources pour chaque réponse"
     use_rerank_label = "Activer le re-ranking (plus lent, parfois plus précis)"
     use_rerank_help = (
         "Utilise un modèle de re-ranking (CrossEncoder) pour réordonner les passages récupérés. "
@@ -495,15 +505,15 @@ else:
 
 **What is hormonAI?**
 
-- hormonAI is a *proof-of-concept* chatbot built on top of a written FAQ about adjuvant hormone therapy for breast cancer.
-- It uses retrieval-augmented generation (RAG): for each question, it searches the FAQ and bases its answer on the most relevant entries.
+- hormonAI is a *proof-of-concept* chatbot built on a knowledge base (articles and FAQs) about adjuvant hormone therapy for breast cancer.
+- It uses retrieval-augmented generation (RAG): for each question, it searches the knowledge base and bases its answer on the most relevant entries.
 
 **Very important safety notes**
 
 - hormonAI does **not** replace your oncologist, GP, or healthcare team.
 - It is **not** an emergency service and does not provide personalized medical advice.
 - It should never be used to decide whether to start, stop, or change a treatment.
-- hormonAI is restricted to the content of the FAQ and may say “I don’t know” when a question goes beyond that scope.
+- hormonAI is restricted to its knowledge base and may say “I don’t know” when a question goes beyond that scope.
 
 Always discuss your situation and any treatment decisions directly with your oncology team.
 
@@ -519,13 +529,13 @@ Always discuss your situation and any treatment decisions directly with your onc
     prompt_label = "Ask your question about adjuvant hormone therapy…"
     use_llm_label = "Use LLM for rephrasing (advanced)"
     use_llm_help = (
-        "If disabled, hormonAI answers directly with the FAQ text.\n"
-        "If enabled, the LLM only rephrases when an answer is found in the FAQ."
+        "If disabled, hormonAI answers directly with the source text.\n"
+        "If enabled, the LLM only rephrases when an answer is found in the knowledge base."
     )
-    show_sources_label = "Show FAQ sources for each answer"
+    show_sources_label = "Show sources for each answer"
     use_rerank_label = "Enable reranking (slower, sometimes more accurate)"
     use_rerank_help = (
-        "Uses a CrossEncoder reranker to reorder retrieved FAQ entries. "
+        "Uses a CrossEncoder reranker to reorder retrieved entries. "
         "This can improve relevance, but it’s slower and requires extra dependencies."
     )
     sample_prompts_label = "Not sure how to phrase your question? Try one of these:"
@@ -567,7 +577,7 @@ use_rerank = st.sidebar.checkbox(
 show_sources = st.sidebar.checkbox(
     show_sources_label,
     value=True,
-    help="Display the FAQ questions/sections that were used for the answer.",
+    help="Display the source entries/sections used for the answer.",
 )
 
 st.sidebar.markdown("---")
@@ -580,14 +590,16 @@ def load_shared_retriever(rerank: bool) -> HybridFAQRetriever:
     # same-language preferred, cross-lingual fallback. Query language is set
     # per request below.
     r = HybridFAQRetriever(language="en", rerank=rerank, shared=True,
-                           embedding_model=DEFAULT_EMBEDDING_MODEL)
+                           embedding_model=DEFAULT_EMBEDDING_MODEL,
+                           rerank_model=DEFAULT_RERANK_MODEL)
     r.load()
     return r
 
 @st.cache_resource
 def load_perlang_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
     r = HybridFAQRetriever(language=lang, rerank=rerank,
-                           embedding_model=DEFAULT_EMBEDDING_MODEL)
+                           embedding_model=DEFAULT_EMBEDDING_MODEL,
+                           rerank_model=DEFAULT_RERANK_MODEL)
     r.load()
     return r
 
@@ -602,7 +614,7 @@ except Exception:
     try:
         retriever = load_perlang_retriever(language, use_rerank)
     except Exception as e:
-        st.error(f"Error loading FAQ data for language '{language}': {e}")
+        st.error(f"Error loading knowledge base for language '{language}': {e}")
         st.stop()
 
 # ---------- SESSION STATE ----------
@@ -665,6 +677,9 @@ def handle_send():
             use_llm=use_llm,
             llm_model=DEFAULT_LLM_MODEL,
             debug=False,
+            sem_accept_threshold=SEM_ACCEPT_THRESHOLD,
+            rerank_accept_threshold=RERANK_ACCEPT_THRESHOLD,
+            dense_floor=DENSE_FLOOR,
         )
         answered, answer_text = _coerce_answer_result(res)
     except Exception as e:
@@ -740,9 +755,9 @@ with chat_container:
             # ✅ Only show dropdown when we actually answered AND sources exist
             if show_sources and msg.get("sources"):
                 exp_label = (
-                    "Sources de la FAQ utilisées pour cette réponse"
+                    "Sources utilisées pour cette réponse"
                     if language == "fr"
-                    else "FAQ sources used for this answer"
+                    else "Sources used for this answer"
                 )
                 with st.expander(exp_label):
                     for i, src in enumerate(msg["sources"], start=1):

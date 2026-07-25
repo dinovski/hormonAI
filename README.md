@@ -17,7 +17,7 @@ It is designed to:
 - Semantic-first gating with IDF-weighted anchors (no hand-maintained stopword/generic lists)
 - Model-agnostic embeddings (mpnet, BGE-M3, e5, ...) selected with one setting
 - Source transparency: every answer cites its knowledge-base origin
-- LLM toggle: FAQ text only vs empathetic rephrasing
+- LLM toggle: verbatim quotes vs grounded LLM rephrasing (rewrites ONLY the retrieved text for clarity + empathy, never adding facts; verbatim sources always cited; falls back to verbatim if the LLM is unavailable)
 - Safety guardrails: out-of-scope questions are declined
 - Queries are logged for auditing and source material improvement
 
@@ -34,7 +34,7 @@ For every query, `HybridFAQRetriever.retrieve()` runs **four retrieval channels*
 3. **FAISS index over “Q rephrasing” embeddings** (optional)
 4. **FAISS index over “QA” embeddings** (question + answer text)
 
-Each channel returns a top-k ranked list of FAQ indices. These ranks are then combined using **Reciprocal Rank Fusion (RRF)**:
+Each channel returns a top-k ranked list of candidate indices. These ranks are then combined using **Reciprocal Rank Fusion (RRF)**:
 
 * For each index `idx`, we sum:
   `rrf(rank) = 1 / (60 + rank)`
@@ -76,9 +76,9 @@ The decision to answer or abstain is **semantic-first**: the primary signal is t
 ├── RETRIEVAL_REVIEW.md    # Retrieval design notes and change log
 ├── hormonAI.png           # Logo (used by the GUI)
 ├── data/                  # Generated indexes
-│   ├── faq_all_*          # Combined SHARED multilingual index (FAISS q/qa/qp + BM25 + qa.pkl)
-│   ├── faq_{lang}_*.faiss # Per-language FAISS indexes
-│   └── faq_{lang}_*.pkl   # Per-language metadata / BM25
+│   ├── kb_all_*          # Combined SHARED multilingual index (FAISS q/qa/qp + BM25 + qa.pkl)
+│   ├── kb_{lang}_*.faiss # Per-language FAISS indexes
+│   └── kb_{lang}_*.pkl   # Per-language metadata / BM25
 ├── tests/                 # Evaluation harness + gold set
 │   ├── eval_set.jsonl     # Gold-standard eval cases (EN + FR, categorized)
 │   ├── eval_retrieval.py  # Runs the gold set: recall@k, false-answer/abstention rates
@@ -117,15 +117,18 @@ Sources are declared in a JSON manifest that tags each file's `type` and `lang`.
 ]
 ```
 
-### Set the embedding model (BGE-M3)
+### Set the models (embedding + reranker)
 
-The same model must be used at ingestion and at query time. Export it once so the CLI and GUI pick it up automatically:
+The embedding model must be identical at ingestion and query time. Export the models once so ingestion, the CLI, and the GUI all pick them up automatically:
 
 ```bash
-export HORMONAI_EMBEDDING_MODEL="BAAI/bge-m3"
+export HORMONAI_EMBEDDING_MODEL="BAAI/bge-m3"            # dense embeddings (must match ingest)
+export HORMONAI_RERANK_MODEL="BAAI/bge-reranker-v2-m3"   # cross-encoder reranker (recommended)
 ```
 
-> BGE-M3 is a strong multilingual model loaded via `sentence-transformers`. It downloads a large model on first use and needs more compute than mpnet. Any embedding-model change requires a fresh ingest and a re-calibration of the gate thresholds against the gold eval set.
+The recommended stack is **BGE-M3** embeddings with the matched **bge-reranker-v2-m3** cross-encoder (both multilingual, Apache-2.0). The older `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` reranker (the default if unset) is lighter and CPU-friendly but ranks lay/clinical questions noticeably worse.
+
+> Both are loaded via `sentence-transformers` and download large models on first use (BGE-M3 ~2.3GB, bge-reranker-v2-m3 ~2.3GB); they are much faster on GPU. Changing the embedding model requires a fresh ingest. Changing **either** model changes the score scale, so re-calibrate the gate thresholds (below) against the gold eval set afterward.
 
 ### Check PDF extraction fidelity (recommended before ingesting)
 
@@ -140,7 +143,7 @@ python tests/pdf_fidelity.py --preview --only NCI-HT.pdf
 
 ### Build the indexes
 
-By default `ingest.py` builds **both** the combined shared multilingual index (`faq_all_*`, used for cross-lingual fallback) **and** the per-language indexes (`faq_<lang>_*`):
+By default `ingest.py` builds **both** the combined shared multilingual index (`kb_all_*`, used for cross-lingual fallback) **and** the per-language indexes (`kb_<lang>_*`):
 
 ```bash
 python ingest.py --manifest manifest.json --embedding-model "BAAI/bge-m3"
@@ -153,8 +156,8 @@ Chunking and index selection can be tuned:
 python ingest.py --manifest manifest.json --embedding-model "BAAI/bge-m3" \
   --chunk-size 300 --chunk-overlap 50 --no-per-language
 
-# A/B a second model into a separate prefix (faq_all_bgem3_*, etc.)
-python ingest.py --manifest manifest.json --embedding-model "BAAI/bge-m3" --out-prefix faq_bgem3
+# A/B a second model into a separate prefix (kb_all_bgem3_*, etc.)
+python ingest.py --manifest manifest.json --embedding-model "BAAI/bge-m3" --out-prefix kb_bgem3
 ```
 
 Convenience flags exist for quick runs without a manifest:
@@ -167,17 +170,17 @@ python ingest.py --language en --faq corpus/en/20250613_FAQ_Hormono_EN.docx \
 Outputs per index prefix:
 
 ```text
-faq_all_index_q.faiss     # FAISS on the topic/question side (shared, all languages)
-faq_all_index_qa.faiss    # FAISS on question/heading + body text
-faq_all_index_qp.faiss    # FAISS on question + paraphrases (if any)
-faq_all_qa.pkl            # Unified, lang-tagged items + metadata (embedding model, prefixes)
-faq_all_bm25.pkl          # BM25 index
-faq_<lang>_*              # The same five files, per language
+kb_all_index_q.faiss     # FAISS on the topic/question side (shared, all languages)
+kb_all_index_qa.faiss    # FAISS on question/heading + body text
+kb_all_index_qp.faiss    # FAISS on question + paraphrases (if any)
+kb_all_qa.pkl            # Unified, lang-tagged items + metadata (embedding model, prefixes)
+kb_all_bm25.pkl          # BM25 index
+kb_<lang>_*              # The same five files, per language
 ```
 
 ### Legacy FAQ-only ingestion (`ingest_faq.py`)
 
-The original FAQ-only pipeline is still supported and is what produced the current per-language indexes. It does not build the shared `faq_all_*` index and does not handle articles.
+The original FAQ-only pipeline is still supported and is what produced the current per-language indexes. It does not build the shared `kb_all_*` index and does not handle articles.
 
 ```bash
 python ingest_faq.py -l en -d corpus/en/20250613_FAQ_Hormono_EN.docx
@@ -187,9 +190,14 @@ python ingest_faq.py -l fr -d corpus/fr/20250613_FAQ_Hormono_FR.docx
 python ingest_faq.py -l en --augment-questions --paraphrase-n 6 -d corpus/en/20250613_FAQ_Hormono_EN.docx
 ```
 
-## Test Retreival
-```python
-python tests/eval_retrieval.py --verbose
+## Evaluate retrieval + gating
+
+`tests/eval_set.jsonl` is a gold set (EN + FR, categorized) keyed by **stable item IDs** (e.g. `20250613_FAQ_Hormono_EN:21`), so it survives re-ingestion and corpus growth. `tests/eval_retrieval.py` runs it through the real pipeline and reports decision accuracy, recall@k, **lead-source correctness** (did the answer headline a gold source?), **gold-source-in-bundle**, and the false-abstention / false-answer rates.
+
+```bash
+export HORMONAI_EMBEDDING_MODEL="BAAI/bge-m3"
+export HORMONAI_RERANK_MODEL="BAAI/bge-reranker-v2-m3"
+python tests/eval_retrieval.py --shared --verbose      # evaluate the shared (production) path
 ```
 
 ## Run hormonAI (CLI)
@@ -205,18 +213,45 @@ python chatbot.py -l fr --shared
 `-l` selects the active query language; the shared index answers in that
 language when possible and falls back cross-lingual with a notice otherwise.
 
-## Run with an LLM for rephrasing
+## Run with grounded LLM rephrasing
 ```bash
-python chatbot.py -l en --use-llm
+python chatbot.py -l en --use-llm   # requires Ollama at http://localhost:11434 (default model: llama3.2)
 ```
+With `--use-llm`, the answer is rephrased by the LLM using **only** the retrieved
+source text (for clarity and empathy, never adding facts), and the verbatim
+sources are still cited beneath. If the LLM is unreachable, it falls back to the
+verbatim answer. Without `--use-llm`, the retrieved text is quoted verbatim
+with a fixed empathy line.
 
 ## Run the app (GUI)
 ```bash
-# export the same embedding model used at ingestion, then launch
+# export the same models used at ingestion, then launch
 export HORMONAI_EMBEDDING_MODEL="BAAI/bge-m3"
+export HORMONAI_RERANK_MODEL="BAAI/bge-reranker-v2-m3"
 streamlit run hormonai_app.py
 ```
-The GUI loads the shared `faq_all_*` index automatically (with same-language
+The GUI loads the shared `kb_all_*` index automatically (with same-language
 preference and cross-lingual fallback) and falls back to the per-language
-indexes if `faq_all_*` has not been built. The chat assistant is shown as **Mona**.
+indexes if `kb_all_*` has not been built. The chat assistant is shown as **Mona**.
+
+## Configuration (environment variables)
+
+The CLI, GUI, and eval harness all read these so a calibrated configuration is applied everywhere:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HORMONAI_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | Dense embedding model. **Must match the model used at ingestion.** |
+| `HORMONAI_RERANK_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder reranker. Recommended: `BAAI/bge-reranker-v2-m3`. |
+| `HORMONAI_RERANK_THRESHOLD` | `-1.0` | Accept threshold on the reranker score (when reranking is on). Model-specific — calibrate. |
+| `HORMONAI_SEM_THRESHOLD` | `0.62` | Dense-cosine accept threshold (used when reranking is off). |
+| `HORMONAI_DENSE_FLOOR` | `0.50` | Cosine floor for the high-IDF lexical safety net. |
+| `HORMONAI_LLM_MODEL` | `llama3.2` | Ollama model used for grounded rephrasing (`--use-llm`). |
+
+Thresholds are **model-specific starting points, not tuned values**. After any embedding/reranker change, sweep them on the gold set and set the winning values via these env vars. For a patient-facing tool, keep the out-of-scope **false-answer rate at zero** as the hard constraint.
+
+```bash
+# recalibrate after a model change (watch the FALSE-ANSWER and lead-source-correctness rows)
+python tests/eval_retrieval.py --shared --verbose
+python tests/eval_retrieval.py --shared --rerank-threshold 0     # sweep around the default
+```
 

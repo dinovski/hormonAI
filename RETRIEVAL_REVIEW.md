@@ -1,7 +1,7 @@
 # hormonAI retrieval review
 
 Date: 2026-07-23
-Scope: `rag_core.py`, `ingest_faq.py`, `chatbot.py`, `data/faq_{en,fr}_*`
+Scope: `rag_core.py`, `ingest_faq.py`, `chatbot.py`, `data/kb_{en,fr}_*`
 Corpus size at review: EN = 73 items, FR = 69 items (parsed from a single adjuvant-hormone-therapy DOCX per language).
 
 ## 1. TL;DR
@@ -161,7 +161,7 @@ python ingest.py --manifest manifest.json
 
 # A/B a different embedding model through the same eval harness
 python ingest.py --manifest manifest.json \
-  --embedding-model BAAI/bge-m3 --out-prefix faq_bgem3
+  --embedding-model BAAI/bge-m3 --out-prefix kb_bgem3
 ```
 
 Verified the parsing/chunking/schema logic on sample text (embedding model not runnable in this environment): chunker respects size and overlap and never splits mid-sentence, nested heading breadcrumbs and parent links are built, the unified schema is emitted for both types, and article items correctly bypass the FAQ artifact filter while FAQ fragments are still dropped. Full embedding + retrieval must be run and re-calibrated locally after choosing a model.
@@ -170,19 +170,40 @@ Verified the parsing/chunking/schema logic on sample text (embedding model not r
 
 Moves retrieval from separate per-language indexes to one shared multilingual embedding space, with same-language answers preferred and cross-lingual used only as a recall fallback.
 
-- **Shared index (`ingest.py`):** in addition to the per-language `faq_<lang>_*` artifacts, ingestion now builds a combined `faq_all_*` index across every language (one multilingual model, one FAISS/BM25, every item carrying its own `lang` tag). Toggle with `--shared/--no-shared` and `--per-language/--no-per-language`.
+- **Shared index (`ingest.py`):** in addition to the per-language `kb_<lang>_*` artifacts, ingestion now builds a combined `kb_all_*` index across every language (one multilingual model, one FAISS/BM25, every item carrying its own `lang` tag). Toggle with `--shared/--no-shared` and `--per-language/--no-per-language`.
 - **Per-language IDF, one corpus (`rag_core.py`):** the retriever now computes IDF/anchor statistics per language and keys them on the active query language, so a mixed FR/EN corpus still yields clean, language-correct anchors. `RetrievalCandidate` carries `lang`.
 - **Same-language first, cross-lingual fallback:** the accept decision runs first over same-language candidates; only if that abstains does it retry over the other language. A cross-lingual answer is prefixed with a localized notice ("This information is only available in French." / "Cette information n'est disponible qu'en anglais.") and the FAQ content is quoted verbatim, never machine-translated, preserving the no-fabrication contract. Per-language mode is unchanged (the cross set is empty).
-- **App wiring (`hormonai_app.py`):** loads the shared index and sets the query language per request; falls back to per-language indexes automatically if `faq_all_*` has not been built yet.
+- **App wiring (`hormonai_app.py`):** loads the shared index and sets the query language per request; falls back to per-language indexes automatically if `kb_all_*` has not been built yet.
 - **Model-agnostic still holds:** the shared space uses the one `--embedding-model`; different models per language would break the shared space and are explicitly avoided.
 
 Verified on a synthetic bilingual corpus (embedding model not runnable here): same-language queries answer without a notice; a query whose only relevant content is in the other language answers via the cross-lingual fallback with the correct notice; genuinely out-of-scope queries abstain in both languages; per-language mode is unaffected; and per-language IDF buckets are language-correct (a French stem is "in corpus" for French, an English stem is not).
 
-Operational notes: this needs a re-ingest to produce `faq_all_*` (`python ingest.py --manifest manifest.json`). Thresholds remain model-specific and must be re-calibrated after any model swap. The gold eval set currently uses per-language positional `gold_idx`, so evaluating the cross-lingual path will need gold IDs keyed by item id rather than position (follow-up).
+Operational notes: this needs a re-ingest to produce `kb_all_*` (`python ingest.py --manifest manifest.json`). Thresholds remain model-specific and must be re-calibrated after any model swap. The gold eval set currently uses per-language positional `gold_idx`, so evaluating the cross-lingual path will need gold IDs keyed by item id rather than position (follow-up).
 
 ### Chat display name
 
 The chat box now shows "Mona" (chat panel title and bot message label). The tool/app name remains HormonAI everywhere else (page title, header, logo, about text).
+
+### Round 6 (2026-07-25) — full corpus, calibration hooks, and answer generation
+
+After ingesting the full corpus (414 items: 140 FAQ + 274 article chunks, BGE-M3, 1024-dim), the enlarged/bilingual index exposed several things that only appear at scale:
+
+- **Recall:** `top_k` raised 12 → 40 (the fused pool was too small for a 414-item bilingual corpus; cross-lingual neighbours were crowding out same-language candidates).
+- **Uncalibrated gate:** the accept thresholds were mismatched to the deployed models. `rerank_accept_threshold` default 0.0 → -1.0 (the mmarco cross-encoder scores relevant-but-indirect passages ~ -1..+1). The lexical safety net was also dead: `strong_anchors` used `idf >= average_idf`, which collapses to empty once article vocabulary inflates the average; it now uses a document-frequency cap (`df <= 0.15 * corpus_size`), which is corpus-size-robust.
+- **Stronger reranker:** the reranker model is now an env var (`HORMONAI_RERANK_MODEL`). The recommended upgrade is `BAAI/bge-reranker-v2-m3` (multilingual, distilled from BGE-M3, Apache-2.0), which ranks lay/clinical questions far better than the mmarco MiniLM. Threshold, embedding model, dense floor, and sem threshold are all env vars now (`HORMONAI_*`), read by CLI, GUI, and the eval harness, so a calibrated config applies everywhere.
+- **Multi-source answers:** the bundle now returns up to 3 relevant sources (not just the reranker's #1), so complementary entries appear together. `AnswerResult.source_indices` exposes the full bundle.
+- **Answer generation:** with `--use-llm`, the LLM now performs GROUNDED REPHRASING — it rewrites only the retrieved source text for clarity/empathy, adds no facts, keeps safety caveats, and is told to answer the question generally rather than centre a scenario (e.g. pregnancy) the user did not ask about. Verbatim sources are always cited; if the LLM is unreachable it falls back to the verbatim answer. Without `--use-llm`, output is verbatim quotes as before. (This restores the pre-427c952 "rephrase" behaviour, but grounded + cited.)
+- **Known-hard case:** the "take a break … increase my risk?" query still tends to surface the pregnancy item, because it lexically collides with idx `...:41` "Does pregnancy increase the risk of recurrence?" (same "increase risk" phrase, different subject). This is a lexical false-friend, not a gate bug; the reranker upgrade + general-answer prompt mitigate it. Query expansion is the next lever (retrieval-only, so no fabrication risk) but should be validated on the gold set, not one query.
+
+Naming / wording cleanup:
+
+- **Data-file prefix renamed `faq_*` → `kb_*`** (`kb_all_*`, `kb_<lang>_*`). Reflects that the knowledge base is articles + FAQs, not a single FAQ. `ingest.py --out-prefix` defaults to `kb`; `rag_core` loads `kb_all` / `kb_<lang>`.
+- **User-facing "FAQ" wording removed** where it referred to the whole knowledge base: the answer preface, source labels ("— Source:"), the rephrase preface, the abstain message, and the Streamlit About/sidebar text now say "knowledge base" / "available information" / "sources". "FAQ" is retained only where accurate (the document *type* in the manifest, source filenames).
+
+Gold set:
+
+- **Re-keyed to stable item IDs** (`gold_ids`, e.g. `20250613_FAQ_Hormono_EN:21`) instead of positional `gold_idx`, so it survives re-ingestion. All 62 gold IDs verified against the current corpus.
+- The harness now also reports **lead-source correctness** (did the answer headline a gold source?) and **gold-source-in-bundle**, so retrieval quality is measurable, not anecdotal.
 
 ### Gold eval set — run before shipping any change
 
@@ -202,4 +223,4 @@ python tests/eval_retrieval.py --json eval_results.json
 
 ## Appendix: verification commands
 
-Root cause was reproduced by tracing `extract_core_keywords`/stemming against `data/faq_en_qa.pkl`. Corpus stem-membership counts (`ever`=0, `break`={22,66}, `pause`={42,43}, `stop`={3,35,37,43,44}) and the idx 22 answer text ("A therapeutic break") were read directly from the pickled items. The macOS venv in `ht_faq_rag/` does not run in a Linux sandbox, so the model-loading path was not executed; findings on `answer_query` control flow are from source reading, and the keyword/coverage findings are from direct execution of the equivalent pure-Python logic.
+Root cause was reproduced by tracing `extract_core_keywords`/stemming against `data/kb_en_qa.pkl`. Corpus stem-membership counts (`ever`=0, `break`={22,66}, `pause`={42,43}, `stop`={3,35,37,43,44}) and the idx 22 answer text ("A therapeutic break") were read directly from the pickled items. The macOS venv in `ht_faq_rag/` does not run in a Linux sandbox, so the model-loading path was not executed; findings on `answer_query` control flow are from source reading, and the keyword/coverage findings are from direct execution of the equivalent pure-Python logic.
