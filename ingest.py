@@ -402,10 +402,21 @@ def parse_article(
 # Embedding text builders (shared by ingest and, in spirit, rag_core queries)
 # ---------------------------------------------------------------------------
 
+def _lead_snippet(text: str, n_words: int = 40) -> str:
+    """First ~n_words of a chunk, used as an article's topic representation."""
+    words = re.findall(r"\S+", text or "")
+    return " ".join(words[:n_words])
+
+
 def q_text_for(item: Dict[str, Any]) -> str:
     if item["source_type"] == "faq":
         return f"Section: {item['section']}\nQuestion: {item['question']}"
-    return f"Section: {item['heading_path']}"
+    # Articles have no question. Using only the heading breadcrumb makes the
+    # Q-side degenerate (for PDFs it is just the file name), so all article
+    # chunks look identical to the Q / Q+paraphrase channels. Use the heading
+    # plus the chunk's leading text as a topic proxy so those channels carry
+    # real content.
+    return f"Section: {item['heading_path']}\n{_lead_snippet(item['answer'])}"
 
 
 def qa_text_for(item: Dict[str, Any]) -> str:

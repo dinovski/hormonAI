@@ -571,6 +571,12 @@ class RetrievalCandidate:
     # Language of the source item ("en"/"fr"). Used for same-language-first
     # selection with cross-lingual fallback in shared mode.
     lang: str = ""
+    # Provenance, so display/citation can branch by type. For an article chunk
+    # `question` is a heading breadcrumb (not a real question), so the formatters
+    # must NOT present it as one.
+    source_type: str = "faq"
+    source_id: str = ""
+    heading_path: str = ""
 
 
 @dataclass
@@ -847,6 +853,9 @@ class HybridFAQRetriever:
                     fused_score=float(score),
                     dense_sim=(dense_sim.get(int(idx)) if int(idx) in dense_sim else None),
                     lang=_norm_lang(str(it.get("lang", self.language))),
+                    source_type=source_type,
+                    source_id=str(it.get("source_id", "")),
+                    heading_path=str(it.get("heading_path", "")),
                 )
             )
 
@@ -870,12 +879,24 @@ class HybridFAQRetriever:
 # Formatting functions
 # ---------------------------
 
+def _candidate_title(c: RetrievalCandidate) -> str:
+    """A display heading for a bundle entry. FAQ -> the question; article -> its
+    source document / section heading (never the fake 'question' breadcrumb)."""
+    if c.source_type == "faq":
+        return (c.question or "").strip()
+    hp = (c.heading_path or "").strip()
+    src = (c.source_id or "").strip()
+    if hp and src and hp != src:
+        return f"{src} — {hp}"
+    return hp or src or (c.section or "").strip()
+
+
 def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
     if not bundle:
         return ""
     parts: List[str] = []
     for c in bundle:
-        parts.append(f"**{c.question.strip()}**\n{c.answer.strip()}")
+        parts.append(f"**{_candidate_title(c)}**\n{c.answer.strip()}")
     return "\n\n".join(parts).strip()
 
 
@@ -889,12 +910,18 @@ def _format_preface(language: str) -> str:
 def _format_sources(language: str, bundle: List[RetrievalCandidate]) -> str:
     lang = _norm_lang(language)
     lines: List[str] = []
-    if lang == "fr":
-        for c in bundle:
-            lines.append(f"**— Source :** “{c.question}” (section : {c.section})")
-    else:
-        for c in bundle:
-            lines.append(f"**— Source:** “{c.question}” (section: {c.section})")
+    label = "Source :" if lang == "fr" else "Source:"
+    sec_label = "section :" if lang == "fr" else "section:"
+    for c in bundle:
+        if c.source_type == "faq":
+            lines.append(f"**— {label}** “{c.question}” ({sec_label} {c.section})")
+        else:
+            # Article: cite the source document (+ section heading when it adds
+            # information), not the "question" breadcrumb.
+            src = (c.source_id or c.section or "").strip()
+            hp = (c.heading_path or "").strip()
+            cite = f"{src} — {hp}" if (hp and src and hp != src) else src
+            lines.append(f"**— {label}** {cite}")
     return "\n\n".join(lines).strip()
 
 
@@ -1525,7 +1552,7 @@ def answer_query(
     return AnswerResult(
         answered=True,
         answer_text=answer_text,
-        source_title=top.question,
+        source_title=_candidate_title(top),   # FAQ question or article source, never a filename breadcrumb
         source_section=top.section,
         source_index=top.index,
         source_indices=[c.index for c in bundle],

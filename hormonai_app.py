@@ -650,26 +650,7 @@ def handle_send():
 
     st.session_state.history.append({"role": "user", "content": user_input_val, "sources": None})
 
-    # Compute sources summary (top 3) — only attach if answered=True
-    sources_summary = []
-    try:
-        cands = retriever.retrieve(user_input_val) or []
-        for c in cands[:3]:
-            score = getattr(c, "rerank_score", None)
-            if score is None:
-                score = getattr(c, "fused_score", 0.0)
-            sources_summary.append(
-                {
-                    "index": int(getattr(c, "index", -1)),
-                    "score": float(score),
-                    "section": str(getattr(c, "section", "")),
-                    "question": str(getattr(c, "question", "")),
-                    "answer": str(getattr(c, "answer", "")),
-                }
-            )
-    except Exception:
-        sources_summary = []
-
+    res = None
     try:
         res = answer_query(
             retriever=retriever,
@@ -693,6 +674,28 @@ def handle_send():
                 "I ran into a technical error while trying to answer.\n\n"
                 f"Details: `{e}`"
             )
+
+    # Show the sources ACTUALLY cited in the answer (res.source_indices), rendered
+    # by type (FAQ vs article) so article chunks are not labelled as questions.
+    sources_summary = []
+    if answered and res is not None:
+        try:
+            items = getattr(retriever, "_items", [])
+            for idx in (getattr(res, "source_indices", None) or []):
+                it = items[int(idx)]
+                sources_summary.append(
+                    {
+                        "index": int(idx),
+                        "source_type": str(it.get("source_type", "faq")),
+                        "section": str(it.get("section", "")),
+                        "question": str(it.get("question", "")),
+                        "source_id": str(it.get("source_id", "")),
+                        "heading_path": str(it.get("heading_path", "")),
+                        "answer": str(it.get("answer", "")),
+                    }
+                )
+        except Exception:
+            sources_summary = []
 
     st.session_state.history.append(
         {
@@ -761,16 +764,19 @@ with chat_container:
                 )
                 with st.expander(exp_label):
                     for i, src in enumerate(msg["sources"], start=1):
-                        st.markdown(
-                            f"**Source {i}** – score: <span class='score-pill'>{src['score']:.3f}</span>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(f"- **Section:** {src['section']}")
-                        st.markdown(f"- **Question:** {src['question']}")
+                        st.markdown(f"**Source {i}**")
+                        if src.get("source_type", "faq") == "faq":
+                            st.markdown(f"- **Question:** {src['question']}")
+                            st.markdown(f"- **Section:** {src['section']}")
+                        else:
+                            doc = src.get("source_id") or src.get("section") or ""
+                            hp = src.get("heading_path") or ""
+                            cite = f"{doc} — {hp}" if (hp and hp != doc) else doc
+                            st.markdown(f"- **Document:** {cite}")
                         snippet = src["answer"]
                         if len(snippet) > 350:
                             snippet = snippet[:350] + "…"
-                        st.markdown(f"- **Answer snippet:** {snippet}")
+                        st.markdown(f"- **Excerpt:** {snippet}")
 
 # ---------- USER INPUT ----------
 st.markdown(f'<div class="prompt-label">{prompt_label}</div>', unsafe_allow_html=True)

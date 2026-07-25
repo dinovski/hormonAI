@@ -30,14 +30,16 @@ It is designed to:
 
 For every query, `HybridFAQRetriever.retrieve()` runs **four retrieval channels** and keeps the top `top_k` (default 40) from each:
 
-1. **BM25** (sparse) over the tokenized query vs BM25 docs (built from *heading/section + question + answer*)
-2. **FAISS over "Q" embeddings** — the topic/question side of each item
-3. **FAISS over "QA" embeddings** — question/heading + answer body
-4. **FAISS over "Q+paraphrases" embeddings** — the question index augmented with paraphrases when present (equals the Q index otherwise)
+Each item is either a **FAQ** Q/A pair or an **article** chunk; both are stored in one schema (`question`/`answer`), so the channels apply to the whole knowledge base:
+
+1. **BM25** (sparse) over the tokenized full text (*heading/section + question/title + answer/body*) — for both FAQs and article chunks.
+2. **FAISS over "topic" embeddings** — the FAQ question, or (for an article chunk, which has no question) the heading plus the chunk's leading text as a topic proxy.
+3. **FAISS over "full" embeddings** — FAQ question+answer, or article heading + full chunk body.
+4. **FAISS over "topic+paraphrases" embeddings** — the topic side augmented with question paraphrases when present (equals the topic index otherwise).
 
 The three dense channels are searched with the **same** encoded query vector (encoded once). Each channel returns a top-k ranked list of candidate indices, combined with **Reciprocal Rank Fusion (RRF)**:
 
-* For each candidate `idx`, sum `rrf(rank) = 1 / (60 + rank)` across **all four** channels (BM25 + FAISS-Q + FAISS-QA + FAISS-Q+paraphrases).
+* For each candidate `idx`, sum `rrf(rank) = 1 / (60 + rank)` across **all four** channels (BM25 + topic + full + topic+paraphrases).
 
 That sum is stored as `RetrievalCandidate.fused_score` — a **rank-fusion score**, not a similarity; useful for ordering, no standalone meaning. Retrieval also retains, per candidate, the best dense cosine similarity across the FAISS channels as `RetrievalCandidate.dense_sim` (used by the gate below).
 
