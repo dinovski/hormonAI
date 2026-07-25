@@ -25,41 +25,33 @@ It is designed to:
 [HormonAI corpus](https://www.dropbox.com/scl/fo/wufdoiep8biwrrjygfska/AAnfOC0u-pUUPFAuDTzhncI?rlkey=u2fn41qvhf0vuo7az0vms6tnt&dl=0)
 
 ## Scoring
-1) Retrieval produces a fused score (default)
 
-For every query, `HybridFAQRetriever.retrieve()` runs **four retrieval channels**:
+1) Hybrid retrieval produces a fused score
 
-1. **BM25** over tokenized query vs BM25 docs (built from *heading/section + question + answer*)
-2. **FAISS index over “Q-only” embeddings**
-3. **FAISS index over “Q rephrasing” embeddings** (optional)
-4. **FAISS index over “QA” embeddings** (question + answer text)
+For every query, `HybridFAQRetriever.retrieve()` runs **four retrieval channels** and keeps the top `top_k` (default 40) from each:
 
-Each channel returns a top-k ranked list of candidate indices. These ranks are then combined using **Reciprocal Rank Fusion (RRF)**:
+1. **BM25** (sparse) over the tokenized query vs BM25 docs (built from *heading/section + question + answer*)
+2. **FAISS over "Q" embeddings** — the topic/question side of each item
+3. **FAISS over "QA" embeddings** — question/heading + answer body
+4. **FAISS over "Q+paraphrases" embeddings** — the question index augmented with paraphrases when present (equals the Q index otherwise)
 
-* For each index `idx`, we sum:
-  `rrf(rank) = 1 / (60 + rank)`
-  across BM25 + FAISS(Q) + FAISS(QA).
+The three dense channels are searched with the **same** encoded query vector (encoded once). Each channel returns a top-k ranked list of candidate indices, combined with **Reciprocal Rank Fusion (RRF)**:
 
-That sum is stored as `RetrievalCandidate.fused_score`.
+* For each candidate `idx`, sum `rrf(rank) = 1 / (60 + rank)` across **all four** channels (BM25 + FAISS-Q + FAISS-QA + FAISS-Q+paraphrases).
 
-`fused_score` is **not a similarity score**; it’s a **rank-fusion score**. It’s useful for ordering but its absolute value has no standalone meaning.
+That sum is stored as `RetrievalCandidate.fused_score` — a **rank-fusion score**, not a similarity; useful for ordering, no standalone meaning. Retrieval also retains, per candidate, the best dense cosine similarity across the FAISS channels as `RetrievalCandidate.dense_sim` (used by the gate below).
 
-2) Optional reranking produces rerank_score (only when enabled)
+2) Reranking (on by default) produces rerank_score
 
-If `HybridFAQRetriever(rerank=True)` and CrossEncoder loads successfully:
-* Create pairs:
-  `(user_query, section + question + answer)`
-* The CrossEncoder predicts a relevance score for each candidate.
-* Store it as `RetrievalCandidate.rerank_score`.
-* Sort candidates by rerank_score descending, overriding fused ordering.
+Reranking is **on by default** (`--rerank`; disable with `--no-rerank`). If the CrossEncoder loads:
+* Pairs `(user_query, section + question + answer)` are scored by the cross-encoder,
+* stored as `RetrievalCandidate.rerank_score`, and the candidates are re-sorted by it, overriding the fused ordering.
 
-
-* `fused_score` = the hybrid retrieval “first-pass” ordering
-* `rerank_score` = second-pass reordering using a CrossEncoder
+The reranker model is configurable via `HORMONAI_RERANK_MODEL` (recommended: `BAAI/bge-reranker-v2-m3`). So: `fused_score` = first-pass hybrid ordering; `rerank_score` = second-pass reordering.
 
 3) Answer / abstain decision (semantic-first)
 
-The decision to answer or abstain is **semantic-first**: the primary signal is the CrossEncoder `rerank_score` (when reranking is on) or dense cosine similarity (otherwise). IDF-weighted lexical anchors no longer gate the answer; they only shape multi-concept bundles and provide a recall safety net for rare, highly specific terms. Thresholds (`--rerank-threshold`, `--sem-threshold`, `--dense-floor`) are model-specific and should be calibrated on the gold eval set. See `RETRIEVAL_REVIEW.md` for the full design.
+The decision to answer or abstain is **semantic-first**: the primary signal is the CrossEncoder `rerank_score` (when reranking is on, threshold `--rerank-threshold` / `HORMONAI_RERANK_THRESHOLD`) or dense cosine `dense_sim` (otherwise, threshold `--sem-threshold`). IDF-weighted lexical anchors no longer gate the answer; they only shape multi-concept bundles and provide a recall safety net for rare, highly specific terms (`--dense-floor`). An answer bundles up to 3 relevant sources. Thresholds are model-specific and must be calibrated on the gold eval set. See `RETRIEVAL_REVIEW.md` for the full design.
 
 ---
 
@@ -92,9 +84,9 @@ The decision to answer or abstain is **semantic-first**: the primary signal is t
 
 ## Create a virtual environment and install dependencies
 ```bash
-python3 -m venv ht_faq_rag
+python3 -m venv hormonai_env
 
-source ht_faq_rag/bin/activate
+source hormonai_env/bin/activate
 
 pip install -r requirements.txt
 ```
