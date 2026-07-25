@@ -12,6 +12,7 @@ Key rules:
 
 from __future__ import annotations
 
+import os
 import argparse
 
 from rag_core import HybridFAQRetriever, answer_query, print_debug
@@ -23,7 +24,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--language", "-l", choices=["en", "fr"], default="en")
     p.add_argument("--data-dir", default="data")
     p.add_argument("--top-k", type=int, default=12)
-    p.add_argument("--embedding-model", default="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+    p.add_argument("--embedding-model",
+                   default=os.getenv("HORMONAI_EMBEDDING_MODEL",
+                                     "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"),
+                   help="Must match the model used at ingestion (e.g. BAAI/bge-m3).")
 
     # Reranking is ON by default: it reorders candidates so the coverage/stats
     # gates operate on better-ordered results. Use --no-rerank to disable.
@@ -31,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True,
                    help="CrossEncoder reranking (better ordering, slower). Default: on. Disable with --no-rerank.")
     p.add_argument("--rerank-model", default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
+
+    # Shared multilingual index (faq_all_*): same-language preferred, cross-lingual
+    # fallback. --language then selects the active QUERY language. Default: off
+    # (loads the per-language faq_<lang>_* index).
+    p.add_argument("--shared", action="store_true",
+                   help="Use the combined faq_all_* index (cross-lingual fallback).")
 
     # Gate tuning (calibrate on tests/eval_set.jsonl for the deployed models).
     # Semantic-first: rerank score is primary when --rerank is on, else dense cosine.
@@ -61,6 +71,7 @@ def main() -> None:
         embedding_model=args.embedding_model,
         rerank=args.rerank,
         rerank_model=args.rerank_model,
+        shared=args.shared,
     )
     retriever.load()
 

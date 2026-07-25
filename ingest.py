@@ -6,10 +6,12 @@ Handles two document shapes, which need different treatment:
 
   - FAQ   : atomic Q/A pairs. One chunk per question (question + answer kept
             together). Same behaviour as the original ingest_faq.py.
-  - ARTICLE: free prose. Split on the document's own headings, then split long
-            sections into fixed-size (~word count) child chunks with overlap.
-            Each child keeps a heading breadcrumb and a link to its parent
-            section text (for future parent-document retrieval).
+  - ARTICLE: free prose (.docx, .md, .txt, .pdf). Split on the document's own
+            headings where available (docx styles / markdown '#'); PDFs, which
+            carry no reliable heading structure, are treated as one flowing
+            section. Long sections are split into fixed-size (~word count) child
+            chunks with overlap, each keeping a heading breadcrumb and a link to
+            its parent section text (for future parent-document retrieval).
 
 Both are emitted into ONE unified per-item schema so the retriever stays
 uniform:
@@ -268,6 +270,93 @@ def _sections_from_markdown(path: str) -> List[Section]:
     return sections
 
 
+def extract_pdf_pages(path: str) -> Tuple[List[str], str]:
+    """
+    Return (per-page text, backend). PyMuPDF (fitz) is the default because it
+    reconstructs reading order across multi-column layouts far better than
+    pypdf; pypdf is the fallback if PyMuPDF is unavailable or errors.
+    """
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(path)
+        pages = [(pg.get_text("text") or "") for pg in doc]
+        doc.close()
+        return pages, "pymupdf"
+    except Exception:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        out: List[str] = []
+        for pg in reader.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                out.append("")
+        return out, "pypdf"
+
+
+_PAGE_NUM_RE = re.compile(r"^(page\s*)?\d+(\s*[/of]{1,2}\s*\d+)?$", re.IGNORECASE)
+
+
+def clean_pdf_pages(pages: List[str]) -> str:
+    """
+    Clean common PDF extraction artifacts before chunking:
+      - drop running headers/footers (short lines that repeat across many pages),
+      - drop bare page-number lines ("12", "Page 3", "3 / 14"),
+      - de-hyphenate words split across line wraps ("meno-\\npause" -> "menopause").
+    Returns a single normalized text block.
+    """
+    from collections import Counter
+
+    n = len(pages)
+    per_page_lines: List[List[str]] = []
+    line_counts: "Counter[str]" = Counter()
+    for pg in pages:
+        lines = [ln.strip() for ln in (pg or "").splitlines()]
+        per_page_lines.append(lines)
+        for ln in {l for l in lines if l}:
+            line_counts[ln] += 1
+
+    # A line is boilerplate if it is short and recurs on a large share of pages.
+    # For very short documents (n < 4) the threshold is never reached, so nothing
+    # is stripped -- avoids over-cleaning leaflets.
+    recur_threshold = max(3, int(0.4 * n))
+    boiler = {
+        ln for ln, c in line_counts.items()
+        if c >= recur_threshold and len(ln.split()) <= 12
+    }
+
+    kept_pages: List[str] = []
+    for lines in per_page_lines:
+        keep = []
+        for ln in lines:
+            if not ln or ln in boiler:
+                continue
+            if _PAGE_NUM_RE.match(ln):
+                continue
+            keep.append(ln)
+        kept_pages.append("\n".join(keep))
+
+    text = "\n".join(kept_pages)
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)   # de-hyphenate line wraps
+    return normalize_spaces(text)
+
+
+def _sections_from_pdf(path: str) -> List[Section]:
+    """
+    Extract a PDF into one flowing section per document. PDFs carry no reliable
+    heading structure (no styles), so rather than guess headings and risk
+    fragmenting the text, the whole document is treated as a single section
+    (after header/footer + hyphenation cleaning) and handed to the sentence-aware
+    chunker. The heading breadcrumb falls back to the file name; the chunk text
+    itself carries the meaning for retrieval.
+    """
+    pages, _backend = extract_pdf_pages(path)
+    full = clean_pdf_pages(pages)
+    if not full:
+        return []
+    return [Section(heading_path=[], paragraphs=[full])]
+
+
 def parse_article(
     path: str,
     lang: str,
@@ -279,6 +368,8 @@ def parse_article(
         sections = _sections_from_docx(path)
     elif ext in (".md", ".markdown", ".txt"):
         sections = _sections_from_markdown(path)
+    elif ext == ".pdf":
+        sections = _sections_from_pdf(path)
     else:
         raise ValueError(f"Unsupported article format: {ext} ({path})")
 
@@ -458,7 +549,7 @@ def main() -> None:
     ap.add_argument("--manifest", default=None,
                     help="JSON list of {path, type: faq|article, lang: en|fr}.")
     ap.add_argument("--faq", action="append", help="FAQ .docx path (repeatable).")
-    ap.add_argument("--article", action="append", help="Article .docx/.md/.txt path (repeatable).")
+    ap.add_argument("--article", action="append", help="Article .docx/.md/.txt/.pdf path (repeatable).")
     ap.add_argument("--language", "-l", choices=["en", "fr"], default="en",
                     help="Language for --faq/--article convenience flags.")
     ap.add_argument("--data-dir", default="data")

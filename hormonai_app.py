@@ -16,6 +16,12 @@ st.set_page_config(
 )
 
 DEFAULT_LLM_MODEL = os.getenv("HORMONAI_LLM_MODEL", "llama3.2")
+# Must match the model used at ingestion (e.g. BAAI/bge-m3). Overriding the
+# embedding model without re-ingesting will fail the FAISS dimension check.
+DEFAULT_EMBEDDING_MODEL = os.getenv(
+    "HORMONAI_EMBEDDING_MODEL",
+    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+)
 
 
 # ---------- SAMPLE PROMPTS (from patient-forum research) ----------
@@ -573,13 +579,15 @@ def load_shared_retriever(rerank: bool) -> HybridFAQRetriever:
     # Combined multilingual index (faq_all_*): one shared embedding space,
     # same-language preferred, cross-lingual fallback. Query language is set
     # per request below.
-    r = HybridFAQRetriever(language="en", rerank=rerank, shared=True)
+    r = HybridFAQRetriever(language="en", rerank=rerank, shared=True,
+                           embedding_model=DEFAULT_EMBEDDING_MODEL)
     r.load()
     return r
 
 @st.cache_resource
 def load_perlang_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
-    r = HybridFAQRetriever(language=lang, rerank=rerank)
+    r = HybridFAQRetriever(language=lang, rerank=rerank,
+                           embedding_model=DEFAULT_EMBEDDING_MODEL)
     r.load()
     return r
 

@@ -1,0 +1,7 @@
+[
+  {"path": "corpus/en/20250613_FAQ_Hormono_EN.docx", "type": "faq",     "lang": "en"},
+  {"path": "corpus/en/BCN-Tamoxifen.pdf",             "type": "article", "lang": "en"},
+  {"path": "corpus/en/BCRF-HT.docx",                  "type": "article", "lang": "en"},
+  {"path": "corpus/fr/20250613_FAQ_Hormono_FR.docx",  "type": "faq",     "lang": "fr"},
+  {"path": "corpus/fr/SCC-HT.pdf",                    "type": "article", "lang": "fr"}
+]

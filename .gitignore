@@ -12,5 +12,8 @@ __pycache__/
 logs/
 *.log
 
+# Source knowledge base (local, potentially large / third-party material)
+corpus/
+
 # OS cruft
 .DS_Store
