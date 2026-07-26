@@ -66,12 +66,12 @@ SAMPLE_PROMPTS = {
             "Who should I contact if I experience troubling side effects?",
         ],
         "Starting or stopping treatment": [
-            "Is it more effective in the morning, afternoon, or evening?",
+            "Is it more effective to take hormone therapy in the morning, afternoon, or evening?",
             "Is it important to take my hormone therapy pill at the same time every day?",
             "Is it ever okay to take a break from hormone therapy, or does that increase my risk?",
         ],
         "Mood, sleep, cognition": [
-            "What can I ask my care team about managing depression or brain fog while on this treatment?",
+            "What can I ask my care team about managing depression or brain fog?",
         ],
         "Nutrition": [
             "Are there foods I must avoid during treatment?",

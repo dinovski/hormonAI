@@ -66,7 +66,7 @@ The decision to answer or abstain is **semantic-first**: the primary signal is t
 ├── chatbot.py             # Command-line chatbot
 ├── hormonai_app.py        # Streamlit GUI (chat assistant shown as "Mona")
 ├── audit_logger.py        # Query logger
-├── manifest.example.json  # Example ingestion manifest (FAQ + articles, EN + FR)
+├── manifest.json          # Ingestion manifest (FAQ + articles, EN + FR)
 ├── RETRIEVAL_REVIEW.md    # Retrieval design notes and change log
 ├── hormonAI.png           # Logo (used by the GUI)
 ├── data/                  # Generated indexes
@@ -100,7 +100,7 @@ pip install -r requirements.txt
 - **FAQ** documents (`.docx`): parsed into atomic Q/A pairs.
 - **Article** documents (`.docx`, `.md`, `.txt`, `.pdf`): split on their own headings where available (docx styles / markdown `#`), then into fixed-size overlapping child chunks that keep a heading breadcrumb and a link to their parent section. PDFs carry no reliable heading structure, so each PDF is treated as one flowing document and chunked directly. PDF text is extracted with **PyMuPDF** (falling back to `pypdf`) and cleaned (running headers/footers removed, hyphenated line-wraps rejoined, page-number lines dropped).
 
-Sources are declared in a JSON manifest that tags each file's `type` and `lang`. A local knowledge-base directory (e.g. `corpus/`) is referenced by pointing the manifest paths at it (see `manifest.example.json`):
+Sources are declared in a JSON manifest that tags each file's `type` and `lang`. A local knowledge-base directory (e.g. `corpus/`) is referenced by pointing the manifest paths at it:
 
 ```json
 [
@@ -228,6 +228,32 @@ The GUI loads the shared `kb_all_*` index automatically (with same-language
 preference and cross-lingual fallback) and falls back to the per-language
 indexes if `kb_all_*` has not been built. The chat assistant is shown as **Mona**.
 
+### Launch with parameters
+
+The GUI accepts the **exact same launch arguments as the CLI** (`chatbot.py`),
+passed through Streamlit after a `--` separator. This is the quickest way to
+tune retrieval without editing code or exporting env vars:
+
+```bash
+# rerank fewer candidates (faster) with a stronger reranker, and show a
+# per-query latency breakdown under each answer
+streamlit run hormonai_app.py -- \
+  --rerank-top-n 10 \
+  --rerank-model BAAI/bge-reranker-v2-m3 \
+  --rerank-threshold 0.2 \
+  --debug
+```
+
+Everything after `--` goes to the app's argument parser. Precedence is
+**flag > environment variable > built-in default**, so any argument not passed
+falls back to the matching `HORMONAI_*` env var (below). Retrieval/config flags
+(`--rerank-top-n`, `--rerank-model`, `--embedding-model`, `--top-k`,
+`--sem-threshold`, `--rerank-threshold`, `--dense-floor`, `--llm-model`) apply
+directly; interactive flags (`--language`, `--use-llm`, `--rerank/--no-rerank`)
+seed the sidebar defaults, which can still be changed live. Model choices and
+`--top-k` are launch-time only (the index is cached and the embedding model must
+match ingestion).
+
 ## Configuration (environment variables)
 
 The CLI, GUI, and eval harness all read these so a calibrated configuration is applied everywhere:
@@ -236,6 +262,7 @@ The CLI, GUI, and eval harness all read these so a calibrated configuration is a
 |---|---|---|
 | `HORMONAI_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | Dense embedding model. **Must match the model used at ingestion.** |
 | `HORMONAI_RERANK_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder reranker. Recommended: `BAAI/bge-reranker-v2-m3`. |
+| `HORMONAI_RERANK_TOP_N` | `20` | Rerank only the top-N fused candidates. Lower is faster (esp. a large reranker on CPU); higher gives a little more recall. |
 | `HORMONAI_RERANK_THRESHOLD` | `-1.0` | Accept threshold on the reranker score (when reranking is on). Model-specific — calibrate. |
 | `HORMONAI_SEM_THRESHOLD` | `0.62` | Dense-cosine accept threshold (used when reranking is off). |
 | `HORMONAI_DENSE_FLOOR` | `0.50` | Cosine floor for the high-IDF lexical safety net. |

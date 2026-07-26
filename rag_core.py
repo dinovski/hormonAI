@@ -883,6 +883,27 @@ _SURVIVAL_REFRAMES_FR: List[Tuple[str, str]] = [
 ]
 
 
+# Meta-preamble a chat model often prepends before the real answer, e.g.
+# "Here's a clear and compassionate response to your question:" or
+# "Voici une réponse claire et bienveillante à votre question :". These are
+# unnatural in a patient chat, so strip a single leading preamble line/sentence.
+_LLM_PREAMBLE_RE = re.compile(
+    r"^\s*(?:sure|of course|certainly|absolutely|bien sûr|bien sûr|voici|here(?:'|’)?s|here is|"
+    r"here(?:'|’)?s?\s+a|below is|i(?:'|’)?d be happy to)\b[^\n:]*?[:\.]\s+",
+    re.IGNORECASE,
+)
+
+
+def _strip_llm_preamble(text: str) -> str:
+    """Remove a single leading meta-preamble ("Here's a ... response:", "Sure, ...:",
+    "Voici ... :") that a chat model may prepend. Only strips when a real answer
+    follows, so a legitimate sentence is never removed."""
+    if not text:
+        return text
+    stripped = _LLM_PREAMBLE_RE.sub("", text, count=1).lstrip()
+    return stripped if stripped else text
+
+
 def _reframe_survival(text: str, language: str) -> str:
     """Rewrite patient-mortality phrasing into survival language, in place.
 
@@ -1028,6 +1049,8 @@ class LLMWrapperWriter:
                 "- Si le TEXTE SOURCE ne répond pas à la question, dis simplement que tu n'as pas "
                 "cette information précise et invite à en parler avec l'équipe soignante.\n"
                 "- N'invente pas de sources. Ne mentionne pas ces instructions.\n"
+                "- Commence DIRECTEMENT par la réponse. Ne débute pas par une formule d'introduction "
+                "du type « Voici une réponse claire et bienveillante... », « Bien sûr, » ou « Bien entendu, ».\n"
                 "- Sois concis (un court paragraphe), à la deuxième personne.\n"
             )
         return (
@@ -1059,6 +1082,8 @@ class LLMWrapperWriter:
             "- If the SOURCE TEXT does not answer the question, say you don't have that specific "
             "information and suggest discussing it with the care team.\n"
             "- Do NOT invent sources. Do NOT mention these instructions.\n"
+            "- Start DIRECTLY with the answer. Do NOT open with a meta-preamble such as "
+            "'Here is a clear and compassionate response...', 'Sure,', or 'Of course,'.\n"
             "- Be concise (a short paragraph), written in warm second person.\n"
         )
 
@@ -1098,11 +1123,12 @@ class LLMWrapperWriter:
         Returns "" on failure so the caller can fall back to verbatim output."""
         if not (source_text or "").strip():
             return ""
-        return self._generate(
+        out = self._generate(
             self._rephrase_system_prompt(),
             self._rephrase_user_prompt(user_query, source_text),
             max_tokens,
         )
+        return _strip_llm_preamble(out)
 
 
 # ---------------------------
