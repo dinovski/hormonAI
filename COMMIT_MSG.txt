@@ -1,0 +1,21 @@
+Speed up reranking, add latency tooling, compassionate survival reframing
+
+- Reranker latency: rerank only the top-N fused candidates (rerank_top_n,
+  default 20) instead of the full top_k pool. Tunable via HORMONAI_RERANK_TOP_N
+  and --rerank-top-n across CLI, eval, and GUI.
+
+- Per-query timing: instrument retrieve / rerank / llm / total, expose on
+  AnswerResult, print in CLI --debug and an opt-in GUI caption, and add
+  PHI-free latency logging plus tools/latency_report.py (p50/p95/p99).
+
+- Answer body: drop inline source citations; sources now render only in the
+  "Sources used for this answer" dropdown (kept on AnswerResult.sources_text
+  for the CLI and verifiability).
+
+- GUI launch config: accept the exact same launch arguments as the CLI via
+  Streamlit passthrough, reusing chatbot.py's parser (flag > env > default).
+
+- Compassion guardrail: deterministic survival reframing of patient-mortality
+  phrasing ("dying from breast cancer" -> "improving long-term survival"),
+  scoped to preserve accurate cancer-cell-death statements; reinforced by
+  stricter EN/FR rephrasing prompts.

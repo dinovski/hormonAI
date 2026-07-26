@@ -72,6 +72,9 @@ def main() -> int:
     ap.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--rerank-model",
                     default=os.getenv("HORMONAI_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"))
+    ap.add_argument("--rerank-top-n", type=int,
+                    default=int(os.getenv("HORMONAI_RERANK_TOP_N", "20")),
+                    help="Rerank only the top-N fused candidates (match the deployed value).")
     ap.add_argument("--sem-threshold", type=float, default=0.62,
                     help="Dense cosine accept threshold (reranking OFF).")
     ap.add_argument("--rerank-threshold", type=float, default=-1.0,
@@ -95,7 +98,8 @@ def main() -> int:
         shared = HybridFAQRetriever(
             language="en", data_dir=args.data_dir, top_k=args.top_k,
             embedding_model=args.embedding_model, rerank=args.rerank,
-            rerank_model=args.rerank_model, shared=True,
+            rerank_model=args.rerank_model, rerank_top_n=args.rerank_top_n,
+            shared=True,
         )
         shared.load()
         for lang in langs:
@@ -110,6 +114,7 @@ def main() -> int:
                 embedding_model=args.embedding_model,
                 rerank=args.rerank,
                 rerank_model=args.rerank_model,
+                rerank_top_n=args.rerank_top_n,
             )
             r.load()
             retrievers[lang] = r

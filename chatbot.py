@@ -44,18 +44,25 @@ def parse_args() -> argparse.Namespace:
     # (loads the per-language faq_<lang>_* index).
     p.add_argument("--shared", action="store_true",
                    help="Use the combined faq_all_* index (cross-lingual fallback).")
+    p.add_argument("--rerank-top-n", type=int,
+                   default=int(os.getenv("HORMONAI_RERANK_TOP_N", "20")),
+                   help="Rerank only the top-N fused candidates (lower = faster; default 20).")
 
     # Gate tuning (calibrate on tests/eval_set.jsonl for the deployed models).
     # Semantic-first: rerank score is primary when --rerank is on, else dense cosine.
-    p.add_argument("--sem-threshold", type=float, default=0.62,
+    p.add_argument("--sem-threshold", type=float,
+                   default=float(os.getenv("HORMONAI_SEM_THRESHOLD", "0.62")),
                    help="Dense cosine accept threshold when reranking is OFF (default: 0.62).")
-    p.add_argument("--rerank-threshold", type=float, default=-1.0,
+    p.add_argument("--rerank-threshold", type=float,
+                   default=float(os.getenv("HORMONAI_RERANK_THRESHOLD", "-1.0")),
                    help="Cross-encoder accept threshold when reranking is ON (default: -1.0; calibrate on eval set).")
-    p.add_argument("--dense-floor", type=float, default=0.50,
+    p.add_argument("--dense-floor", type=float,
+                   default=float(os.getenv("HORMONAI_DENSE_FLOOR", "0.50")),
                    help="Permissive cosine floor for the high-IDF lexical safety net (default: 0.50).")
 
     p.add_argument("--use-llm", action="store_true", help="Add an empathetic tone wrapper with an LLM (ONLY for answered queries).")
-    p.add_argument("--llm-model", default="llama3.2", help="Ollama model name (default: llama3.2).")
+    p.add_argument("--llm-model", default=os.getenv("HORMONAI_LLM_MODEL", "llama3.2"),
+                   help="Ollama model name (default: llama3.2).")
 
     p.add_argument("--debug", action="store_true")
     p.add_argument("--audit-log", default="logs/audit.jsonl")
@@ -74,6 +81,7 @@ def main() -> None:
         embedding_model=args.embedding_model,
         rerank=args.rerank,
         rerank_model=args.rerank_model,
+        rerank_top_n=args.rerank_top_n,
         shared=args.shared,
     )
     retriever.load()
@@ -121,10 +129,16 @@ def main() -> None:
             used_llm=(args.use_llm and result.answered),
             source_index=result.source_index,
             source_question=result.source_title,
+            timing_ms=result.timing_ms,
             meta=(result.debug if args.debug else None),
         )
 
         print("\nBot:", result.answer_text, "\n")
+        # Sources are kept out of the answer body (the GUI shows them in a
+        # dropdown); print them here so the CLI answer stays verifiable.
+        if result.sources_text:
+            label = "Sources :" if args.language == "fr" else "Sources:"
+            print(label, "\n" + result.sources_text, "\n")
 
 
 if __name__ == "__main__":

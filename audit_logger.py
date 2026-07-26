@@ -31,8 +31,17 @@ class AuditLogger:
         used_llm: bool,
         source_index: Optional[int] = None,
         source_question: Optional[str] = None,
+        timing_ms: Optional[Dict[str, Any]] = None,
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # Round latency numbers so the log stays compact and easy to aggregate
+        # (p50/p95) later. `n_reranked` is kept as-is (a count, not a duration).
+        timing: Dict[str, Any] = {}
+        for k, v in (timing_ms or {}).items():
+            if k == "n_reranked":
+                timing[k] = v
+            elif isinstance(v, (int, float)):
+                timing[k] = round(float(v), 1)
         self.log(
             {
                 "type": "query",
@@ -42,6 +51,7 @@ class AuditLogger:
                 "used_llm": used_llm,
                 "source_index": source_index,
                 "source_question": source_question,
+                "timing_ms": timing,
                 "meta": meta or {},
             }
         )

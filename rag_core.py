@@ -4,6 +4,7 @@ import os
 import re
 import json
 import math
+import time
 import pickle
 import hashlib
 from collections import Counter
@@ -75,95 +76,10 @@ def _looks_like_faq_question(question: str) -> bool:
     return False
 
 
-# ---------------------------
-# Stopwords / keyword gating
-# ---------------------------
-
-EN_STOPWORDS = {
-    "a","an","the","and","or","but","if","then","than","so","because",
-    "to","of","in","on","for","with","as","at","by","from","into","about",
-    "is","are","was","were","be","been","being",
-    "do","does","did","doing",
-    "while","during","using",
-    "can","could","should","would","will","may","might","must",
-    "i","you","we","they","he","she","it","my","your","our","their",
-    "this","that","these","those",
-    "what","why","how","when","where","which",
-    "m","im","ive","id","ill","dont","cant","wont","youre","were","theyre","isnt","arent",
-    "have","having",
-    # function words / discourse fillers that carry no retrievable concept.
-    # These previously survived as "anchors" and could never be matched in the
-    # corpus, forcing false abstentions (e.g. "ever" in the break/risk example).
-    "ever","never","always","really","actually","just","still","instead","anymore",
-    "sometimes","often","maybe","perhaps","also","too","much","many","more","most",
-    "even","yet","already","soon","later","now","thing","things","stuff","way","ways",
-    "okay","ok","please","thanks","thank","hello","hi","hey","yes","no","not",
-    "am","being","being","about","around","over","under","between",
-    "want","wanting","wanted","wonder","wondering","tell","told","ask","asking","know","knowing",
-    "mean","means","meant","like","kind","sort","bit","lot","lots",
-}
-
-FR_STOPWORDS = {
-    "le","la","les","un","une","des","et","ou","mais","si","alors",
-    "de","du","dans","sur","pour","avec","par","au","aux","en",
-    "est","sont","été","etre","être","avoir","a","ont",
-    "je","tu","il","elle","nous","vous","ils","elles",
-    "ce","cet","cette","ces",
-    "quoi","pourquoi","comment","quand","où","ou","quel","quelle","quels","quelles",
-    "j","t","c","d","l","n","qu",
-    "ai","as","avons","avez","ont","avais","avait","aviez","avaient",
-    # French function words / fillers (mirror of the English additions).
-    "jamais","toujours","vraiment","juste","encore","plutôt","plutot","aussi","trop",
-    "beaucoup","plus","parfois","souvent","peut-être","peut","être","déjà","deja",
-    "maintenant","bientôt","bientot","chose","choses","truc","trucs","façon","facon",
-    "d'accord","daccord","merci","bonjour","salut","oui","non","pas","ne",
-    "vouloir","veux","veut","savoir","sais","sait","dire","dis","dit","demander",
-    "genre","sorte","peu",
-}
-
-GENERIC_EN = {
-    "safe","safety","careful","need","should","can","could","would","risk","danger",
-    "allowed","ok","okay","possible","recommend","recommended","advice",
-    "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
-    "take","taking","taken",
-    "get","getting","got",
-    "health",
-    "issue","issues","problem","problems","symptom","symptoms","trouble","troubles",
-}
-
-GENERIC_FR = {
-    "sûr","sur","sure","sécurité","securite","prudent","prudence","besoin","dois","devrais","peux",
-    "risque","danger","autorisé","autorise","possible","recommandé","recommande","conseil",
-    "hormone","hormonale","hormonothérapie","hormonotherapie",
-    "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
-    "prendre","prends","pris",
-    "sante","santé",
-    "problème","probleme","problèmes","problemes","souci","soucis","symptôme","symptome","symptômes","symptomes",
-}
-
-EMOTION_EN = {
-    "worried","worry","concerned","concern","anxious","anxiety","scared","afraid",
-    "fear","terrified","panic","panicking","stressed","stress","upset",
-}
-
-EMOTION_FR = {
-    "inquiet","inquiete","inquiète","inquiét","inquietude","inquiétude",
-    "angoisse","angoissé","angoissee","peur","effrayé","effrayee",
-    "stress","stresse","stressé","stressée","préoccupé","preoccupe","préoccupée","preoccupee",
-}
-
-DRUG_TREATMENT_EN = {
-    "tamoxifen","letrozole","anastrozole","exemestane",
-    "aromatase","inhibitor","inhibitors",
-    "hormone","hormonal","therapy","treatment","medication","pill","medicine","drug","drugs",
-}
-
-DRUG_TREATMENT_FR = {
-    "tamoxifène","tamoxifene","létrozole","letrozole","anastrozole","exemestane",
-    "aromatase","inhibiteur","inhibiteurs",
-    "hormone","hormonale","hormonothérapie","hormonotherapie",
-    "traitement","thérapie","therapie","médicament","medicament","comprimé","comprime","pilule",
-}
+# NOTE: the old hand-maintained EN/FR stopword, generic, emotion, and
+# drug-term lists (and extract_core_keywords / anchor_keywords / _emotion_stems)
+# were removed. Anchor extraction is now IDF-weighted (extract_anchor_concepts +
+# a small domain-independent _MINIMAL_FUNCTION_WORDS set); see that function.
 
 
 # ---------------------------
@@ -308,12 +224,6 @@ def _stem_set(tokens: List[str], language: str) -> Set[str]:
     return {_stem(t, language) for t in tokens if t}
 
 
-def _emotion_stems(language: str) -> Set[str]:
-    lang = _norm_lang(language)
-    emo = EMOTION_FR if lang == "fr" else EMOTION_EN
-    return {_stem(w, lang) for w in emo}
-
-
 # ---------------------------
 # Lay ↔ clinical synonym sets (MATCHING ONLY)
 # ---------------------------
@@ -397,53 +307,6 @@ def _anchor_overlap_concepts(text: str, anchor_concepts: Set[str], language: str
         if len(text_stems.intersection(acceptable)) > 0:
             covered.add(concept)
     return covered
-
-
-# ---------------------------
-# Keyword extraction / anchors
-# ---------------------------
-
-def extract_core_keywords(user_query: str, language: str) -> List[str]:
-    lang = _norm_lang(language)
-    toks = _tokenize(user_query)
-
-    stop = FR_STOPWORDS if lang == "fr" else EN_STOPWORDS
-    gen = GENERIC_FR if lang == "fr" else GENERIC_EN
-    emo = EMOTION_FR if lang == "fr" else EMOTION_EN
-
-    out: List[str] = []
-    for t in toks:
-        if t in stop:
-            continue
-        if t in gen:
-            continue
-        if t in emo:
-            continue
-        if len(t) <= 2:
-            continue
-        out.append(t)
-
-    seen = set()
-    dedup: List[str] = []
-    for t in out:
-        if t not in seen:
-            seen.add(t)
-            dedup.append(t)
-    return dedup
-
-
-def anchor_keywords(core_kws: List[str], language: str) -> List[str]:
-    lang = _norm_lang(language)
-    drugset = DRUG_TREATMENT_FR if lang == "fr" else DRUG_TREATMENT_EN
-    anchors = [k for k in core_kws if k not in drugset]
-
-    seen = set()
-    out: List[str] = []
-    for a in anchors:
-        if a not in seen:
-            seen.add(a)
-            out.append(a)
-    return out
 
 
 # ---------------------------
@@ -587,6 +450,8 @@ class AnswerResult:
     source_section: Optional[str] = None
     source_index: Optional[int] = None
     source_indices: Optional[List[int]] = None   # positional indices of every bundled source
+    sources_text: Optional[str] = None            # formatted citations, kept OUT of answer_text
+    timing_ms: Optional[Dict[str, Any]] = None    # per-query latency breakdown (always populated)
     debug: Optional[Dict[str, Any]] = None
 
 
@@ -603,6 +468,7 @@ class HybridFAQRetriever:
         embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         rerank: bool = False,
         rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        rerank_top_n: int = 20,   # only rerank the top-N fused candidates (latency vs. recall)
         shared: bool = False,
         corpus_prefix: Optional[str] = None,
     ):
@@ -621,6 +487,7 @@ class HybridFAQRetriever:
 
         self.rerank = rerank
         self.rerank_model = rerank_model
+        self.rerank_top_n = max(2, int(rerank_top_n))
 
         self._items: List[Dict[str, Any]] = []
         self._bm25: Optional[BM25Okapi] = None
@@ -774,6 +641,9 @@ class HybridFAQRetriever:
         return self._active_stats()["avg"]
 
     def retrieve(self, user_query: str) -> List[RetrievalCandidate]:
+        # Per-query latency breakdown, readable via `retriever.last_timing_ms`
+        # (populated on every call; surfaced in --debug output).
+        self.last_timing_ms: Dict[str, Any] = {"retrieve": 0.0, "rerank": 0.0, "n_reranked": 0}
         if not self._items:
             return []
 
@@ -781,6 +651,7 @@ class HybridFAQRetriever:
         assert self._index_q is not None
         assert self._index_qa is not None
 
+        _t_retrieve = time.perf_counter()
         bm25_scores = self._bm25.get_scores(_tokenize(user_query))
         bm25_ranked = np.argsort(-bm25_scores)[: self.top_k]
 
@@ -859,18 +730,32 @@ class HybridFAQRetriever:
                 )
             )
 
+        # Embedding + BM25 + FAISS search + fusion are done; the rest is reranking.
+        self.last_timing_ms["retrieve"] = (time.perf_counter() - _t_retrieve) * 1000.0
+
         if self._cross_encoder is not None and len(candidates) >= 2:
-            pairs = [(user_query, f"{c.section}\n{c.question}\n{c.answer}") for c in candidates]
+            # Rerank only a SHORTLIST of the best fused candidates, not the whole
+            # top_k pool. Cross-encoder cost is linear in the number of pairs, and
+            # a large reranker (e.g. bge-reranker-v2-m3) over 40 pairs is the main
+            # per-query latency. `candidates` is already sorted by fused score, so
+            # the top `rerank_top_n` are the strongest hybrid hits; the reranked
+            # shortlist is returned and the weaker tail is dropped.
+            shortlist = candidates[: self.rerank_top_n]
+            pairs = [(user_query, f"{c.section}\n{c.question}\n{c.answer}") for c in shortlist]
+            _t_rerank = time.perf_counter()
             try:
                 ce_scores = self._cross_encoder.predict(pairs)
-                for c, s in zip(candidates, ce_scores):
+                for c, s in zip(shortlist, ce_scores):
                     c.rerank_score = float(s)
-                candidates.sort(
+                shortlist.sort(
                     key=lambda c: c.rerank_score if c.rerank_score is not None else -1e9,
                     reverse=True,
                 )
+                candidates = shortlist
+                self.last_timing_ms["n_reranked"] = len(pairs)
             except Exception:
                 pass
+            self.last_timing_ms["rerank"] = (time.perf_counter() - _t_rerank) * 1000.0
 
         return candidates
 
@@ -903,8 +788,8 @@ def _format_bundle_body(language: str, bundle: List[RetrievalCandidate]) -> str:
 def _format_preface(language: str) -> str:
     lang = _norm_lang(language)
     if lang == "fr":
-        return "**Voici les informations disponibles sur ce sujet (cela ne remplace pas l’avis de votre équipe soignante) :**\n\n"
-    return "**Here is the available information on this topic (this does not replace advice from your care team):**\n\n"
+        return "**Voici les informations disponibles sur ce sujet :**\n\n"
+    return "**Here is the available information on this topic:**\n\n"
 
 
 def _format_sources(language: str, bundle: List[RetrievalCandidate]) -> str:
@@ -932,16 +817,6 @@ def _format_full_answer(language: str, body: str, sources: str) -> str:
     return (pre + (body or "").strip()).strip()
 
 
-def _format_preface_rephrased(language: str) -> str:
-    """Preface used when the LLM has rephrased (not quoted) the source text."""
-    lang = _norm_lang(language)
-    if lang == "fr":
-        return ("**D’après les informations disponibles sur l’hormonothérapie (information générale "
-                "qui ne remplace pas l’avis de votre équipe soignante) :**\n\n")
-    return ("**Based on the available hormone therapy information (general information that does not "
-            "replace advice from your care team):**\n\n")
-
-
 def _bundle_source_text(bundle: List[RetrievalCandidate]) -> str:
     """Verbatim source text handed to the LLM for grounded rephrasing. FAQ items
     keep their question as a mini-heading; article chunks (whose 'question' is a
@@ -955,6 +830,83 @@ def _bundle_source_text(bundle: List[RetrievalCandidate]) -> str:
         else:
             parts.append(a)
     return "\n\n".join(p for p in parts if p).strip()
+
+
+# ---------------------------
+# Compassionate survival reframing
+# ---------------------------
+#
+# Patient-facing answers must not describe the person's own outcome with the
+# words "death"/"dying" (or FR "mort"/"mourir"/"décès"). It is fine, and often
+# more accurate, to speak of SURVIVAL instead. The source corpus itself uses
+# mortality phrasing (e.g. NCI: "lower your risk of ... and of dying from breast
+# cancer"), so a grounded rephrase or verbatim quote will echo it unless we
+# reframe deterministically here -- a prompt alone is not reliable with a small
+# local model.
+#
+# IMPORTANT: the patterns are NARROW on purpose. They match only patient-
+# mortality constructions (".. dying/death FROM breast cancer/the cancer/it",
+# ".. risk/chance of dying .."). They deliberately do NOT touch statements about
+# cancer CELLS dying ("the cells may die", "la mort des cellules cancéreuses"),
+# which are accurate, desirable, and not distressing.
+
+_SURVIVAL_REFRAMES_EN: List[Tuple[str, str]] = [
+    # "the risk of (you) dying [from ...]" -> threat-to-survival framing
+    (r"\bthe risk of (?:you |your )?dying(?: from (?:breast cancer|the cancer|it))?\b",
+     "the risk to your long-term survival"),
+    # "risk/chance/likelihood of dying [from ...]"
+    (r"\b(?:risk|chance|chances|likelihood) of dying(?: from (?:breast cancer|the cancer|it))?\b",
+     "risk to long-term survival"),
+    # "risk/chance of death from ..."
+    (r"\b(?:risk|chance|chances|likelihood) of death(?: from (?:breast cancer|the cancer|it))?\b",
+     "risk to long-term survival"),
+    # list/conjunction context: "..., as well as / and (of) dying from ..."
+    (r"\s*,?\s*(?:as well as|and)\s+(?:of\s+)?dying from (?:breast cancer|the cancer|it)\b",
+     ", as well as improving long-term survival"),
+    # any remaining "dying/death from <cancer/it>"
+    (r"\bdying from (?:breast cancer|the cancer|it)\b", "affecting long-term survival"),
+    (r"\bdeath from (?:breast cancer|the cancer|it)\b", "long-term survival"),
+]
+
+_SURVIVAL_REFRAMES_FR: List[Tuple[str, str]] = [
+    # "réduire/diminuer (le risque de) mortalité du/par cancer du sein" -> survie
+    (r"\b(réduire|réduit|diminuer|diminue|abaisser|abaisse|baisser)\s+(?:la\s+|le\s+)?"
+     r"(?:risque de\s+)?mortalité\s+(?:du|par)\s+cancer du sein\b",
+     r"améliorer la survie au cancer du sein"),
+    (r"\bla mortalité\s+(?:du|par)\s+cancer du sein\b", "la survie au cancer du sein"),
+    # "risque de décès / de mourir [du cancer du sein / de la maladie]"
+    (r"\brisque de (?:décès|mourir)(?:\s+(?:du|par)\s+cancer du sein|\s+de la maladie)?\b",
+     "risque pour la survie à long terme"),
+    # "mourir du cancer du sein / de la maladie" and "en mourir"
+    (r"\bmourir\s+(?:du cancer du sein|de la maladie)\b", "pour la survie à long terme"),
+    (r"\ben mourir\b", "pour la survie à long terme"),
+]
+
+
+def _reframe_survival(text: str, language: str) -> str:
+    """Rewrite patient-mortality phrasing into survival language, in place.
+
+    Deterministic and narrowly scoped so accurate cancer-cell-death statements
+    are preserved. Applied to the final patient-facing answer (both the grounded
+    LLM rephrase and the verbatim path), never to the cited source snippets in
+    the Sources dropdown (those stay verbatim for verifiability)."""
+    if not text:
+        return text
+    is_fr = _norm_lang(language) == "fr"
+    rules = _SURVIVAL_REFRAMES_FR if is_fr else _SURVIVAL_REFRAMES_EN
+    out = text
+    for pattern, repl in rules:
+        out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
+    if is_fr:
+        # Restore French elision broken by a substitution starting with a vowel
+        # (e.g. "de améliorer" -> "d'améliorer", "que améliorer" -> "qu'améliorer").
+        out = re.sub(r"\b([dlncjmts])e améliorer\b", r"\1'améliorer", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bque améliorer\b", "qu'améliorer", out, flags=re.IGNORECASE)
+    # Tidy artifacts a substitution can leave behind (", ," or doubled spaces).
+    out = re.sub(r"\s+,", ",", out)
+    out = re.sub(r",\s*,", ",", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out
 
 
 # ---------------------------
@@ -1019,6 +971,7 @@ class LLMWrapperWriter:
                 "- N'écris AUCUN fait médical, aucun détail pratique.\n"
                 "- N'invente rien sur la situation de la personne.\n"
                 "- Ne donne aucune statistique, aucun ordre de grandeur, aucune explication technique.\n"
+                "- Emploie un langage doux et non alarmant ; n'évoque pas la mort, le décès ni le pronostic.\n"
                 "- N'inclus pas de citations, ni de sections.\n"
                 "- 2–3 phrases MAX.\n"
             )
@@ -1030,6 +983,7 @@ class LLMWrapperWriter:
             "- Provide NO medical facts and no practical details.\n"
             "- Do not assume anything about the person’s situation.\n"
             "- Do not provide statistics, magnitudes, or technical explanations.\n"
+            "- Use gentle, non-alarming language; do not mention death, dying, or prognosis.\n"
             "- No citations/sections.\n"
             "- 2–3 sentences MAX.\n"
         )
@@ -1056,6 +1010,21 @@ class LLMWrapperWriter:
                 "l'a explicitement demandé ; si une source ne traite que d'un tel scénario, mentionne-le "
                 "brièvement au maximum.\n"
                 "- N'omets aucune mise en garde ou condition de sécurité présente dans le texte.\n"
+                "- TON: emploie un langage doux, bienveillant et non alarmant.\n"
+                "- FORMULATION EN TERMES DE SURVIE (OBLIGATOIRE): n'emploie JAMAIS les mots « mort », "
+                "« mourir » ou « décès » à propos de la patiente elle-même. Lorsque la source indique un "
+                "bénéfice sur la mortalité, exprime-le plutôt en termes de SURVIE. Par exemple, reformule "
+                "« réduit le risque de mourir du cancer du sein » en « peut aider à améliorer la survie à "
+                "long terme ». C'est un changement de FORMULATION uniquement : conserve le même sens et le "
+                "même degré de certitude que la source.\n"
+                "- Les mots « mort »/« mourir » ne sont acceptables que lorsqu'il s'agit des CELLULES "
+                "cancéreuses (par exemple « les cellules cancéreuses sont détruites ») ; privilégie alors "
+                "« détruites » ou « cessent de croître ». Ne les applique jamais à la personne.\n"
+                "- Évite aussi les formulations brutales sur la récidive : dis « peut aider à réduire le "
+                "risque que le cancer revienne » sans changer le sens.\n"
+                "- Conserve le degré de certitude de la source : privilégie « peut aider à réduire le "
+                "risque de… » plutôt que des mots absolus comme « empêche », « arrête » ou « garantit ». "
+                "Ne surestime jamais un bénéfice, ne donne pas de fausse réassurance et ne minimise pas un risque réel.\n"
                 "- Si le TEXTE SOURCE ne répond pas à la question, dis simplement que tu n'as pas "
                 "cette information précise et invite à en parler avec l'équipe soignante.\n"
                 "- N'invente pas de sources. Ne mentionne pas ces instructions.\n"
@@ -1072,6 +1041,21 @@ class LLMWrapperWriter:
             "answer on a specific scenario (for example pregnancy) unless the user explicitly asked "
             "about it; if a source only covers such a scenario, mention it briefly at most.\n"
             "- Do NOT omit any safety-relevant caveat or condition present in the source.\n"
+            "- TONE: use gentle, compassionate, non-alarming language.\n"
+            "- SURVIVAL FRAMING (REQUIRED): NEVER describe the patient's own outcome with the words "
+            "'death', 'dying', or 'die'. When the source states a mortality benefit, express it in "
+            "terms of SURVIVAL instead. For example, rephrase 'lowers the risk of dying from breast "
+            "cancer' as 'can help improve long-term survival' or 'lowers the risk to long-term "
+            "survival'. This is a wording change ONLY: keep the same meaning and the same level of "
+            "certainty as the source.\n"
+            "- The words 'die'/'death' are acceptable ONLY when the source refers to cancer CELLS "
+            "(e.g. 'the cancer cells are destroyed'); prefer 'destroyed' or 'stop growing' there. "
+            "Never apply death/dying language to the person.\n"
+            "- Also avoid blunt wording about the cancer returning; say 'can help lower the chance of "
+            "the cancer coming back' rather than harsh phrasing, without changing the meaning.\n"
+            "- Preserve the source's degree of certainty: prefer 'can help reduce the risk of ...' "
+            "over absolute words like 'prevents', 'stops', or 'ensures'. Never overstate a benefit, "
+            "give false reassurance, or minimise a real risk.\n"
             "- If the SOURCE TEXT does not answer the question, say you don't have that specific "
             "information and suggest discussing it with the care team.\n"
             "- Do NOT invent sources. Do NOT mention these instructions.\n"
@@ -1437,7 +1421,10 @@ def answer_query(
     lowering thresholds.
     """
     lang = _norm_lang(retriever.language)
+    _t_total = time.perf_counter()
     candidates = retriever.retrieve(user_query)
+    timing = dict(getattr(retriever, "last_timing_ms", {}) or {})
+    timing["llm"] = 0.0
 
     ax = extract_anchor_concepts(user_query, lang, retriever)
     anchors = ax.anchors
@@ -1456,6 +1443,7 @@ def answer_query(
     dbg: Dict[str, Any] = {}
     if debug:
         dbg["query_lang"] = lang
+        dbg["timing_ms"] = timing  # same dict object; llm/total filled in below
         dbg["shared_mode"] = bool(getattr(retriever, "shared", False))
         dbg["anchors"] = anchors
         dbg["strong_anchors"] = sorted(list(strong_anchors))
@@ -1475,7 +1463,9 @@ def answer_query(
         ]
 
     if not candidates:
-        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+        timing["total"] = (time.perf_counter() - _t_total) * 1000.0
+        return AnswerResult(answered=False, answer_text=build_abstain(lang),
+                            timing_ms=timing, debug=(dbg if debug else None))
 
     thresholds = {
         "sem_accept_threshold": sem_accept_threshold,
@@ -1510,17 +1500,21 @@ def answer_query(
     if not bundle:
         if debug:
             dbg.setdefault("decision_path", "abstain")
-        return AnswerResult(answered=False, answer_text=build_abstain(lang), debug=(dbg if debug else None))
+        timing["total"] = (time.perf_counter() - _t_total) * 1000.0
+        return AnswerResult(answered=False, answer_text=build_abstain(lang),
+                            timing_ms=timing, debug=(dbg if debug else None))
 
-    # Labels/preface are in the QUERY language. Source citations are always
-    # appended verbatim so the answer is verifiable.
+    # Labels/preface are in the QUERY language. Source citations are computed here
+    # but kept OUT of the answer body: the UI shows them in the "Sources used for
+    # this answer" dropdown (built from source_indices), and CLI/verifiability
+    # consumers can read them from AnswerResult.sources_text.
     sources = _format_sources(lang, bundle)
     notice_block = (notice + "\n\n") if notice else ""
 
     def _verbatim_answer() -> str:
         # FAQ content quoted verbatim + fixed empathy sentence (original behavior).
         faq_body = _format_bundle_body(lang, bundle)
-        factual_block = _format_full_answer(lang, faq_body, sources)
+        factual_block = _format_full_answer(lang, faq_body, "")
         prefix = _fallback_empathy(lang, user_query, bundle[0].question)
         return (prefix + notice_block + factual_block).strip()
 
@@ -1530,13 +1524,13 @@ def answer_query(
         # If the LLM is unreachable/empty, fall back to the verbatim answer so we
         # never lose a response.
         source_text = _bundle_source_text(bundle)
+        _t_llm = time.perf_counter()
         rephrased = LLMWrapperWriter(language=lang, model=llm_model).rephrase(
             user_query=user_query, source_text=source_text
         ).strip()
+        timing["llm"] = (time.perf_counter() - _t_llm) * 1000.0
         if rephrased:
-            answer_text = (
-                _format_preface_rephrased(lang) + notice_block + rephrased + "\n\n" + sources
-            ).strip()
+            answer_text = (notice_block + rephrased).strip()
             if debug:
                 dbg["llm_mode"] = "rephrase"
         else:
@@ -1548,6 +1542,14 @@ def answer_query(
         if debug:
             dbg["llm_mode"] = "verbatim"
 
+    # Compassion guardrail: reframe patient-mortality phrasing ("dying from breast
+    # cancer") into survival language. Deterministic, so it holds regardless of
+    # what the local LLM emits and covers the verbatim path too. Applied to the
+    # answer body only; cited sources in the dropdown stay verbatim.
+    answer_text = _reframe_survival(answer_text, lang)
+
+    timing["total"] = (time.perf_counter() - _t_total) * 1000.0
+
     top = bundle[0]
     return AnswerResult(
         answered=True,
@@ -1556,6 +1558,8 @@ def answer_query(
         source_section=top.section,
         source_index=top.index,
         source_indices=[c.index for c in bundle],
+        sources_text=sources,
+        timing_ms=timing,
         debug=(dbg if debug else None),
     )
 
@@ -1583,6 +1587,12 @@ def print_debug(result: AnswerResult) -> None:
     print("[DEBUG] sem_top_sim:", result.debug.get("sem_top_sim"))
     print("[DEBUG] decision_path:", result.debug.get("decision_path"))
     print("[DEBUG] qp_index_loaded:", result.debug.get("qp_index_loaded"))
+
+    t = result.debug.get("timing_ms") or {}
+    if t:
+        print("[DEBUG] timing_ms: retrieve={:.0f} rerank={:.0f} (n={}) llm={:.0f} total={:.0f}".format(
+            t.get("retrieve", 0.0), t.get("rerank", 0.0), t.get("n_reranked", 0),
+            t.get("llm", 0.0), t.get("total", 0.0)))
 
     if "stats_required_concepts" in result.debug:
         print("[DEBUG] stats_required_concepts:", result.debug.get("stats_required_concepts"))

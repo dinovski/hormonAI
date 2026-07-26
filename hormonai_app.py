@@ -7,6 +7,7 @@ from rag_core import (
     HybridFAQRetriever,
     answer_query,
 )
+from audit_logger import AuditLogger
 
 # ---------- BASIC PAGE CONFIG ----------
 st.set_page_config(
@@ -15,43 +16,66 @@ st.set_page_config(
     layout="centered",
 )
 
-DEFAULT_LLM_MODEL = os.getenv("HORMONAI_LLM_MODEL", "llama3.2")
+# ---------- LAUNCH-TIME CONFIG ----------
+# The GUI accepts EXACTLY the same launch arguments as the CLI (chatbot.py), via
+# Streamlit's passthrough after `--`, e.g.:
+#   streamlit run hormonai_app.py -- --rerank-top-n 10 --rerank-model BAAI/bge-reranker-v2-m3
+# We reuse the CLI's argparse definition verbatim so the two never drift. With no
+# passthrough args, every value falls back to its CLI default (which reads the
+# same HORMONAI_* env vars), so existing env-based configuration keeps working.
+# Streamlit puts only the post-`--` tokens on sys.argv, so this parses cleanly.
+from chatbot import parse_args as _parse_cli_args  # noqa: E402
+
+ARGS = _parse_cli_args()
+
+DEFAULT_LLM_MODEL = ARGS.llm_model
 # Must match the model used at ingestion (e.g. BAAI/bge-m3). Overriding the
 # embedding model without re-ingesting will fail the FAISS dimension check.
-DEFAULT_EMBEDDING_MODEL = os.getenv(
-    "HORMONAI_EMBEDDING_MODEL",
-    "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-)
-# Accept/abstain thresholds. Defaults are conservative starting points and are
-# model-specific -- calibrate on the gold eval set and set these env vars so the
-# GUI uses the calibrated values (see README / RETRIEVAL_REVIEW.md).
+DEFAULT_EMBEDDING_MODEL = ARGS.embedding_model
 # Reranker model. Upgrade to a stronger multilingual cross-encoder (e.g.
-# BAAI/bge-reranker-v2-m3, which pairs with BGE-M3) by setting this env var.
-# Changing it requires re-calibrating HORMONAI_RERANK_THRESHOLD (different scale).
-DEFAULT_RERANK_MODEL = os.getenv("HORMONAI_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
-RERANK_ACCEPT_THRESHOLD = float(os.getenv("HORMONAI_RERANK_THRESHOLD", "-1.0"))
-SEM_ACCEPT_THRESHOLD = float(os.getenv("HORMONAI_SEM_THRESHOLD", "0.62"))
-DENSE_FLOOR = float(os.getenv("HORMONAI_DENSE_FLOOR", "0.50"))
+# BAAI/bge-reranker-v2-m3, which pairs with BGE-M3) via --rerank-model.
+# Changing it requires re-calibrating --rerank-threshold (different scale).
+DEFAULT_RERANK_MODEL = ARGS.rerank_model
+# Only rerank the top-N fused candidates. Lower = faster (esp. with a large
+# reranker like bge-reranker-v2-m3 on CPU); higher = a bit more recall.
+DEFAULT_RERANK_TOP_N = ARGS.rerank_top_n
+DEFAULT_TOP_K = ARGS.top_k
+DEFAULT_DATA_DIR = ARGS.data_dir
+# Accept/abstain thresholds. Defaults are conservative and model-specific --
+# calibrate on the gold eval set, then pass --sem-threshold / --rerank-threshold
+# / --dense-floor at launch (or set the matching HORMONAI_* env vars).
+RERANK_ACCEPT_THRESHOLD = ARGS.rerank_threshold
+SEM_ACCEPT_THRESHOLD = ARGS.sem_threshold
+DENSE_FLOOR = ARGS.dense_floor
+# --debug (or HORMONAI_SHOW_TIMING=1) prints a per-query latency breakdown under
+# each answer (retrieve / rerank / llm / total). Off by default (patient UI).
+SHOW_TIMING = bool(getattr(ARGS, "debug", False)) or os.getenv("HORMONAI_SHOW_TIMING", "0") == "1"
+# HORMONAI_AUDIT_LATENCY=1 appends a per-query LATENCY record (timing + language
+# + answered ONLY -- never the raw patient query) for p50/p95 tracking. Off by
+# default. Path from --audit-log (CLI default logs/audit.jsonl).
+AUDIT_LATENCY = os.getenv("HORMONAI_AUDIT_LATENCY", "0") == "1"
+AUDIT_LOG_PATH = ARGS.audit_log
 
 
 # ---------- SAMPLE PROMPTS (from patient-forum research) ----------
 SAMPLE_PROMPTS = {
     "en": {
         "Side effects": [
-            "How do I tell the difference between a side effect I can wait out and one that needs urgent attention?",
-        ],
-        "Uterine/endometrial cancer risk": [
-            "What symptoms would actually be a red flag for uterine cancer versus just a tamoxifen side effect?",
+            "What are the most common side effects?",
+            "Do side effects like hot flashes last the entire duration of treatment?",
+            "Who should I contact if I experience troubling side effects?",
         ],
         "Starting or stopping treatment": [
-            "I'm worried about side effects and longterm health. How do I weigh that against my risk of recurrence if I don't take hormone therapy?",
+            "Is it more effective in the morning, afternoon, or evening?",
+            "Is it important to take my hormone therapy pill at the same time every day?",
             "Is it ever okay to take a break from hormone therapy, or does that increase my risk?",
         ],
         "Mood, sleep, cognition": [
             "What can I ask my care team about managing depression or brain fog while on this treatment?",
         ],
-        "Digestive symptoms": [
-            "What can I do about the stomach pain and heartburn I'm getting since starting tamoxifen?",
+        "Nutrition": [
+            "Are there foods I must avoid during treatment?",
+            "Is it safe to drink herbal teas?",
         ],
         "Managing side effects": [
             "Are there ways to reduce side effects, like changing when I take my dose or switching brands?",
@@ -62,30 +86,31 @@ SAMPLE_PROMPTS = {
             "What are my options for painful sex or low libido on this treatment?",
         ],
         "Long-term monitoring": [
-            "What tests should I be getting regularly while on an aromatase inhibitor — bone scans, cholesterol, anything else?",
-            "Should I be worried about heart health on this medication?",
+            "What tests should I be getting regularly — bone scans, cholesterol, anything else?",
+            "Does hormone therapy require cardiovascular monitoring?",
         ],
         "Duration and stopping": [
-            "How is the decision made about whether I need 5 vs 10 years of treatment?",
+            "How long will I need to take hormone therapy?",
             "What happens to my body when I eventually stop hormone therapy?",
         ],
     },
     "fr": {
         "Effets secondaires": [
-            "Comment faire la différence entre un effet secondaire à surveiller et un effet qui nécessite une attention urgente ?",
-        ],
-        "Risque de cancer de l'utérus/de l'endomètre": [
-            "Quels symptômes seraient réellement un signal d'alarme pour un cancer de l'utérus, par rapport à un simple effet secondaire du tamoxifène ?",
+            "Quels sont les effets secondaires les plus courants de l’hormonothérapie ?",
+            "Les effets indésirables, comme les bouffées de chaleur, durent-ils toute la durée du traitement ?",
+            "Qui contacter en cas d'effet indésirable ?",
         ],
         "Commencer ou arrêter le traitement": [
-            "J'ai peur des effets secondaires — comment mettre cela en balance avec mon risque de récidive si je n'ai pas d'hormonothérapie ?",
+            "Y a-t-il une meilleure efficacité à prendre le traitement le matin, le midi ou le soir ?",
+            "Est-ce important de prendre le cachet à heure fixe ?",
             "Est-ce parfois acceptable de faire une pause dans l'hormonothérapie, ou cela augmente-t-il mon risque ?",
         ],
         "Humeur, sommeil, cognition": [
             "Que puis-je demander à mon équipe soignante pour gérer la dépression ou le brouillard mental pendant ce traitement ?",
         ],
-        "Symptômes digestifs": [
-            "Que puis-je faire contre les douleurs à l'estomac et les brûlures d'estomac depuis que j'ai commencé le tamoxifène ?",
+        "Alimentation": [
+            "Y a-t-il des aliments interdits pendant le traitement ?",
+            "Les tisanes sont-elles compatibles avec l’hormonothérapie ?",
         ],
         "Gérer les effets secondaires": [
             "Existe-t-il des moyens de réduire les effets secondaires, comme changer l'heure de ma prise ou changer de marque ?",
@@ -96,11 +121,11 @@ SAMPLE_PROMPTS = {
             "Quelles sont mes options en cas de rapports douloureux ou de baisse de libido pendant ce traitement ?",
         ],
         "Suivi à long terme": [
-            "Quels examens devrais-je faire régulièrement sous inhibiteur de l'aromatase — densité osseuse, cholestérol, autre chose ?",
-            "Dois-je m'inquiéter de ma santé cardiaque avec ce médicament ?",
+            "Quels examens devrais-je faire régulièrement — densité osseuse, cholestérol, autre chose ?",
+            "L'hormonothérapie nécessite-t-elle une surveillance cardiovasculaire ?",
         ],
         "Durée et arrêt du traitement": [
-            "Comment décide-t-on si j'ai besoin de 5 ou 10 ans de traitement ?",
+            "Pendant combien de temps devrai-je suivre une hormonothérapie ?",
             "Que se passe-t-il dans mon corps quand j'arrête finalement l'hormonothérapie ?",
         ],
     },
@@ -447,10 +472,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------- SIDEBAR: MONA PORTRAIT ----------
+_m_l, _m_c, _m_r = st.sidebar.columns([1, 3, 1])
+with _m_c:
+    st.image("mona.png", use_container_width=True)
+st.sidebar.markdown(
+    "<div style='text-align:center; color:#a34e68; font-weight:650; "
+    "font-size:1.05rem; margin-top:-4px; margin-bottom:6px;'></div>",
+    unsafe_allow_html=True,
+)
+
 # ---------- SIDEBAR: LANGUAGE FIRST ----------
+_LANG_OPTIONS = ["en", "fr"]
 language = st.sidebar.selectbox(
     "Language / Langue",
-    options=["en", "fr"],
+    options=_LANG_OPTIONS,
+    index=(_LANG_OPTIONS.index(ARGS.language) if ARGS.language in _LANG_OPTIONS else 0),
     format_func=lambda x: "English" if x == "en" else "Français",
 )
 
@@ -564,13 +601,13 @@ st.sidebar.header(sidebar_header)
 
 use_llm = st.sidebar.checkbox(
     use_llm_label,
-    value=False,
+    value=bool(ARGS.use_llm),
     help=use_llm_help,
 )
 
 use_rerank = st.sidebar.checkbox(
     use_rerank_label,
-    value=True,
+    value=bool(ARGS.rerank),
     help=use_rerank_help,
 )
 
@@ -590,16 +627,20 @@ def load_shared_retriever(rerank: bool) -> HybridFAQRetriever:
     # same-language preferred, cross-lingual fallback. Query language is set
     # per request below.
     r = HybridFAQRetriever(language="en", rerank=rerank, shared=True,
+                           data_dir=DEFAULT_DATA_DIR, top_k=DEFAULT_TOP_K,
                            embedding_model=DEFAULT_EMBEDDING_MODEL,
-                           rerank_model=DEFAULT_RERANK_MODEL)
+                           rerank_model=DEFAULT_RERANK_MODEL,
+                           rerank_top_n=DEFAULT_RERANK_TOP_N)
     r.load()
     return r
 
 @st.cache_resource
 def load_perlang_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
     r = HybridFAQRetriever(language=lang, rerank=rerank,
+                           data_dir=DEFAULT_DATA_DIR, top_k=DEFAULT_TOP_K,
                            embedding_model=DEFAULT_EMBEDDING_MODEL,
-                           rerank_model=DEFAULT_RERANK_MODEL)
+                           rerank_model=DEFAULT_RERANK_MODEL,
+                           rerank_top_n=DEFAULT_RERANK_TOP_N)
     r.load()
     return r
 
@@ -631,6 +672,12 @@ if language != st.session_state.last_language or use_rerank != st.session_state.
     st.session_state.history = []
     st.session_state.last_language = language
     st.session_state.last_rerank = use_rerank
+
+# ---------- HANDLE SEND ----------
+@st.cache_resource
+def _get_audit_logger(path: str) -> AuditLogger:
+    return AuditLogger(path)
+
 
 # ---------- HANDLE SEND ----------
 def _coerce_answer_result(res: object) -> tuple[bool, str]:
@@ -697,11 +744,43 @@ def handle_send():
         except Exception:
             sources_summary = []
 
+    # PHI-free latency logging: timing + language + answered only, never the query.
+    if AUDIT_LATENCY and res is not None and getattr(res, "timing_ms", None):
+        try:
+            _get_audit_logger(AUDIT_LOG_PATH).log(
+                {
+                    "type": "latency",
+                    "language": language,
+                    "answered": bool(getattr(res, "answered", False)),
+                    "used_llm": bool(use_llm and getattr(res, "answered", False)),
+                    "timing_ms": {
+                        k: (v if k == "n_reranked" else round(float(v), 1))
+                        for k, v in res.timing_ms.items()
+                        if k == "n_reranked" or isinstance(v, (int, float))
+                    },
+                }
+            )
+        except Exception:
+            pass
+
+    timing_str = None
+    if SHOW_TIMING and res is not None and getattr(res, "timing_ms", None):
+        t = res.timing_ms or {}
+        if t:
+            timing_str = (
+                "retrieve {:.0f} ms | rerank {:.0f} ms (n={}) | "
+                "llm {:.0f} ms | total {:.0f} ms"
+            ).format(
+                t.get("retrieve", 0.0), t.get("rerank", 0.0), t.get("n_reranked", 0),
+                t.get("llm", 0.0), t.get("total", 0.0),
+            )
+
     st.session_state.history.append(
         {
             "role": "bot",
             "content": answer_text,
             "sources": (sources_summary if answered else []),
+            "timing": timing_str,
         }
     )
 
@@ -754,6 +833,9 @@ with chat_container:
             </div>
             """
             st.markdown(bot_html, unsafe_allow_html=True)
+
+            if SHOW_TIMING and msg.get("timing"):
+                st.caption(f"⏱ {msg['timing']}")
 
             # ✅ Only show dropdown when we actually answered AND sources exist
             if show_sources and msg.get("sources"):
