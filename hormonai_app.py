@@ -522,13 +522,13 @@ Discutez toujours de votre situation et de toute décision thérapeutique direct
     chat_title_label = "Discuter avec Mona"
     placeholder = "Par exemple : « Les bouffées de chaleur sont-elles fréquentes ? »"
     prompt_label = "Posez votre question sur l’hormonothérapie adjuvante…"
-    use_llm_label = "Utiliser un LLM pour reformuler (avancé)"
+    use_llm_label = "Utiliser un LLM pour reformuler"
     use_llm_help = (
         "Si désactivé, hormonAI répond directement avec le texte source.\n"
         "Si activé, le LLM reformule uniquement lorsque la réponse est trouvée dans la base de connaissances."
     )
     show_sources_label = "Afficher les sources pour chaque réponse"
-    use_rerank_label = "Activer le re-ranking (plus lent, parfois plus précis)"
+    use_rerank_label = "Activer le re-ranking"
     use_rerank_help = (
         "Utilise un modèle de re-ranking (CrossEncoder) pour réordonner les passages récupérés. "
         "Cela peut améliorer la pertinence, mais c’est plus lent et demande des dépendances supplémentaires."
@@ -564,13 +564,13 @@ Always discuss your situation and any treatment decisions directly with your onc
     chat_title_label = "Chat with Mona"
     placeholder = 'For example: "Is sun exposure contraindicated while taking tamoxifen?"'
     prompt_label = "Ask your question about adjuvant hormone therapy…"
-    use_llm_label = "Use LLM for rephrasing (advanced)"
+    use_llm_label = "Use LLM for rephrasing"
     use_llm_help = (
         "If disabled, hormonAI answers directly with the source text.\n"
         "If enabled, the LLM only rephrases when an answer is found in the knowledge base."
     )
     show_sources_label = "Show sources for each answer"
-    use_rerank_label = "Enable reranking (slower, sometimes more accurate)"
+    use_rerank_label = "Enable reranking"
     use_rerank_help = (
         "Uses a CrossEncoder reranker to reorder retrieved entries. "
         "This can improve relevance, but it’s slower and requires extra dependencies."
