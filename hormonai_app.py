@@ -55,6 +55,14 @@ SHOW_TIMING = bool(getattr(ARGS, "debug", False)) or os.getenv("HORMONAI_SHOW_TI
 # default. Path from --audit-log (CLI default logs/audit.jsonl).
 AUDIT_LATENCY = os.getenv("HORMONAI_AUDIT_LATENCY", "0") == "1"
 AUDIT_LOG_PATH = ARGS.audit_log
+# Language scope of retrieval:
+#   'shared'   -> combined kb_all index, same-language-first + cross-lingual
+#                 fallback (the existing default behavior).
+#   'language' -> search ONLY the query-language corpus (kb_<lang>); an English
+#                 question searches the English corpus only, with no fallback.
+# Set via --retrieval-scope or HORMONAI_RETRIEVAL_SCOPE. Defaults to 'shared'
+# so current behavior is unchanged unless language-only is explicitly requested.
+RETRIEVAL_SCOPE = (getattr(ARGS, "retrieval_scope", None) or "shared").lower()
 
 
 # ---------- SAMPLE PROMPTS (from patient-forum research) ----------
@@ -645,18 +653,36 @@ def load_perlang_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
     return r
 
 retriever = None
-retrieval_mode = "shared"
-try:
-    retriever = load_shared_retriever(use_rerank)
-    retriever.language = language  # active query language on the shared corpus
-except Exception:
-    # faq_all_* not built (or unreadable): fall back to per-language indexes.
-    retrieval_mode = "per-language"
+retrieval_mode = None
+if RETRIEVAL_SCOPE == "language":
+    # Language-only: search just the query-language corpus (kb_<lang>). No
+    # cross-lingual fallback. If that index is missing, fall back to the shared
+    # index so the app still answers.
     try:
         retriever = load_perlang_retriever(language, use_rerank)
-    except Exception as e:
-        st.error(f"Error loading knowledge base for language '{language}': {e}")
-        st.stop()
+        retrieval_mode = "language-only"
+    except Exception:
+        try:
+            retriever = load_shared_retriever(use_rerank)
+            retriever.language = language
+            retrieval_mode = "shared (per-language index unavailable)"
+        except Exception as e:
+            st.error(f"Error loading knowledge base for language '{language}': {e}")
+            st.stop()
+else:
+    # Shared (default): combined index, same-language-first + cross-lingual
+    # fallback. Fall back to the per-language index if kb_all is not built.
+    try:
+        retriever = load_shared_retriever(use_rerank)
+        retriever.language = language  # active query language on the shared corpus
+        retrieval_mode = "shared"
+    except Exception:
+        try:
+            retriever = load_perlang_retriever(language, use_rerank)
+            retrieval_mode = "per-language"
+        except Exception as e:
+            st.error(f"Error loading knowledge base for language '{language}': {e}")
+            st.stop()
 
 # ---------- SESSION STATE ----------
 if "history" not in st.session_state:

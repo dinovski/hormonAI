@@ -44,6 +44,15 @@ def parse_args() -> argparse.Namespace:
     # (loads the per-language faq_<lang>_* index).
     p.add_argument("--shared", action="store_true",
                    help="Use the combined faq_all_* index (cross-lingual fallback).")
+    # Language scope of retrieval. This is the clean, named control:
+    #   shared   -> combined kb_all index, same-language-first + cross-lingual fallback
+    #   language -> ONLY the query-language corpus (kb_<lang>), no cross-lingual fallback
+    # When set, it overrides --shared. Default (unset) keeps the --shared behavior.
+    p.add_argument("--retrieval-scope", choices=["shared", "language"],
+                   default=os.getenv("HORMONAI_RETRIEVAL_SCOPE"),
+                   help="'shared' = combined index with cross-lingual fallback; "
+                        "'language' = search only the query-language corpus. "
+                        "Overrides --shared; env: HORMONAI_RETRIEVAL_SCOPE.")
     p.add_argument("--rerank-top-n", type=int,
                    default=int(os.getenv("HORMONAI_RERANK_TOP_N", "20")),
                    help="Rerank only the top-N fused candidates (lower = faster; default 20).")
@@ -70,10 +79,23 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def resolve_shared(args) -> bool:
+    """Effective index/scope choice. `--retrieval-scope` (when set) wins over the
+    legacy `--shared` flag: 'language' means query-language-only retrieval
+    (per-language index, no cross-lingual fallback); 'shared' means the combined
+    index with cross-lingual fallback."""
+    scope = getattr(args, "retrieval_scope", None)
+    if scope:
+        return scope == "shared"
+    return bool(getattr(args, "shared", False))
+
+
 def main() -> None:
     args = parse_args()
 
-    print(f"Loading retriever for LANGUAGE = {args.language}...")
+    shared = resolve_shared(args)
+    scope_label = "shared (cross-lingual fallback)" if shared else "language-only"
+    print(f"Loading retriever for LANGUAGE = {args.language} | scope = {scope_label}...")
     retriever = HybridFAQRetriever(
         language=args.language,
         data_dir=args.data_dir,
@@ -82,7 +104,7 @@ def main() -> None:
         rerank=args.rerank,
         rerank_model=args.rerank_model,
         rerank_top_n=args.rerank_top_n,
-        shared=args.shared,
+        shared=shared,
     )
     retriever.load()
 

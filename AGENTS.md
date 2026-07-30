@@ -44,7 +44,9 @@ This document provides guidance for AI coding assistants (such as Claude, GitHub
 4. **hormonai_app.py**: Streamlit GUI
    - User-friendly web interface
    - Language switching, LLM toggle, reranking options
-   - Conversation history and source display
+   - Language scope: combined index with cross-lingual fallback, or query-language corpus only (`--retrieval-scope`)
+   - Accepts the same launch arguments as the CLI (Streamlit passthrough after `--`)
+   - Conversation history; sources shown in a "Sources used for this answer" panel (kept out of the answer body)
 
 5. **audit_logger.py**: Query logging system
    - Logs all queries for auditing and FAQ improvement
@@ -71,6 +73,7 @@ The system uses four retrieval channels that are fused together:
 - **Rerank Score** (optional): CrossEncoder second-pass reranking
   - Predicts relevance between query and full FAQ text
   - Overrides fused score when enabled
+  - Reranks only the top-N fused candidates for latency (`rerank_top_n`, default 20)
 
 ---
 

@@ -69,6 +69,10 @@ def main() -> int:
                     help="Must match the model used at ingestion (e.g. BAAI/bge-m3).")
     ap.add_argument("--shared", action="store_true",
                     help="Evaluate the combined faq_all_* index (same-language-first + cross-lingual fallback).")
+    ap.add_argument("--retrieval-scope", choices=["shared", "language"],
+                    default=os.getenv("HORMONAI_RETRIEVAL_SCOPE"),
+                    help="'shared' = combined index with cross-lingual fallback; 'language' = "
+                         "query-language corpus only. Overrides --shared; env HORMONAI_RETRIEVAL_SCOPE.")
     ap.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--rerank-model",
                     default=os.getenv("HORMONAI_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"))
@@ -85,6 +89,9 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true", help="Print every case result.")
     ap.add_argument("--json", default=None, help="Write full per-case results to this JSON file.")
     args = ap.parse_args()
+    # --retrieval-scope (when set) overrides --shared, mirroring the CLI/app.
+    if args.retrieval_scope:
+        args.shared = (args.retrieval_scope == "shared")
 
     cases = load_cases(args.eval_set)
     if args.lang:

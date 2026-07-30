@@ -16,9 +16,12 @@ It is designed to:
 - Hybrid retrieval: dense vector search + BM25 (keyword), fused with Reciprocal Rank Fusion, then optional CrossEncoder reranking
 - Semantic-first gating with IDF-weighted anchors (no hand-maintained stopword/generic lists)
 - Model-agnostic embeddings (mpnet, BGE-M3, e5, ...) selected with one setting
-- Source transparency: every answer cites its knowledge-base origin
-- LLM toggle: verbatim quotes vs grounded LLM rephrasing (rewrites ONLY the retrieved text for clarity + empathy, never adding facts; verbatim sources always cited; falls back to verbatim if the LLM is unavailable)
+- Source transparency: every answer's knowledge-base origin is shown in the "Sources used for this answer" panel (GUI) or printed after the answer (CLI), kept out of the answer body itself
+- LLM toggle: verbatim quotes vs grounded LLM rephrasing (rewrites ONLY the retrieved text for clarity + empathy, never adding facts; falls back to verbatim if the LLM is unavailable)
+- Compassion guardrail: patient-facing answers reframe mortality phrasing into survival language ("dying from breast cancer" -> "improving long-term survival") without changing meaning, and a leading LLM meta-preamble ("Here is a clear and compassionate response...") is stripped
 - Safety guardrails: out-of-scope questions are declined
+- Language scope: retrieve from the combined index with cross-lingual fallback, or restrict to the query-language corpus only (`--retrieval-scope`)
+- Optional per-query latency instrumentation and PHI-free latency logging for p50/p95 tracking
 - Queries are logged for auditing and source material improvement
 
 ## Knowledge base
@@ -78,6 +81,8 @@ The decision to answer or abstain is **semantic-first**: the primary signal is t
 │   ├── eval_retrieval.py  # Runs the gold set: recall@k, false-answer/abstention rates
 │   ├── pdf_fidelity.py    # PDF extraction QA (per-source metrics + preview)
 │   └── inspect_qa.py
+├── tools/                 # Operational helpers
+│   └── latency_report.py  # p50/p95/p99 latency from the audit log
 ├── corpus/                # Source knowledge base (FAQ + articles), by language
 │   ├── en/                # e.g. 20250613_FAQ_Hormono_EN.docx, *.pdf articles
 │   └── fr/                # e.g. 20250613_FAQ_Hormono_FR.docx, *.pdf articles
@@ -104,9 +109,9 @@ Sources are declared in a JSON manifest that tags each file's `type` and `lang`.
 
 ```json
 [
-  {"path": "corpus/en/20250613_FAQ_Hormono_EN.docx", "type": "faq",     "lang": "en"},
+  {"path": "corpus/en/FAQ_Hormono_EN.docx", "type": "faq",     "lang": "en"},
   {"path": "corpus/en/BCN-Tamoxifen.pdf",             "type": "article", "lang": "en"},
-  {"path": "corpus/fr/20250613_FAQ_Hormono_FR.docx",  "type": "faq",     "lang": "fr"},
+  {"path": "corpus/fr/FAQ_Hormono_FR.docx",  "type": "faq",     "lang": "fr"},
   {"path": "corpus/fr/SCC-HT.pdf",                    "type": "article", "lang": "fr"}
 ]
 ```
@@ -154,10 +159,10 @@ python ingest.py --manifest manifest.json --embedding-model "BAAI/bge-m3" \
 python ingest.py --manifest manifest.json --embedding-model "BAAI/bge-m3" --out-prefix kb_bgem3
 ```
 
-Convenience flags exist for quick runs without a manifest:
+Convenience flags for quick runs without a manifest:
 
 ```bash
-python ingest.py --language en --faq corpus/en/20250613_FAQ_Hormono_EN.docx \
+python ingest.py --language en --faq corpus/en/FAQ_Hormono_EN.docx \
   --article corpus/en/BCN-Tamoxifen.pdf --embedding-model "BAAI/bge-m3"
 ```
 
@@ -212,10 +217,19 @@ language when possible and falls back cross-lingual with a notice otherwise.
 python chatbot.py -l en --use-llm   # requires Ollama at http://localhost:11434 (default model: llama3.2)
 ```
 With `--use-llm`, the answer is rephrased by the LLM using **only** the retrieved
-source text (for clarity and empathy, never adding facts), and the verbatim
-sources are still cited beneath. If the LLM is unreachable, it falls back to the
-verbatim answer. Without `--use-llm`, the retrieved text is quoted verbatim
-with a fixed empathy line.
+source text (for clarity and empathy, never adding facts). If the LLM is
+unreachable, it falls back to the verbatim answer. Without `--use-llm`, the
+retrieved text is quoted verbatim with a fixed empathy line.
+
+In both cases the cited sources are kept **out of the answer body**: the GUI
+shows them in the "Sources used for this answer" panel, and the CLI prints them
+after the answer. Two deterministic guardrails also run on the final answer: a
+compassion reframe that turns patient-mortality phrasing into survival language
+(for example "reduce the risk of dying from breast cancer" becomes "improve
+long-term survival") without changing meaning, and removal of any leading LLM
+meta-preamble such as "Here is a clear and compassionate response to your
+question:". These are narrowly scoped, so accurate statements about cancer cells
+dying are left untouched.
 
 ## Run the app (GUI)
 ```bash
@@ -226,7 +240,21 @@ streamlit run hormonai_app.py
 ```
 The GUI loads the shared `kb_all_*` index automatically (with same-language
 preference and cross-lingual fallback) and falls back to the per-language
-indexes if `kb_all_*` has not been built. The chat assistant is shown as **Mona**.
+indexes if `kb_all_*` has not been built.
+
+To search only the corpus in the query's language (for example, English
+questions answered from the English corpus only, with no cross-lingual
+fallback):
+
+```bash
+export HORMONAI_EMBEDDING_MODEL="BAAI/bge-m3"
+export HORMONAI_RERANK_MODEL="BAAI/bge-reranker-v2-m3"
+streamlit run hormonai_app.py -- --retrieval-scope language
+```
+The GUI defaults to `shared` (combined index, cross-lingual fallback) so current
+behavior is unchanged unless `language` is requested. Language-only mode uses the
+per-language `kb_<lang>` index, which ingestion builds by default (unless run with
+`--no-per-language`); if it is missing, the app falls back to the shared index.
 
 ### Launch with parameters
 
@@ -263,10 +291,13 @@ The CLI, GUI, and eval harness all read these so a calibrated configuration is a
 | `HORMONAI_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | Dense embedding model. **Must match the model used at ingestion.** |
 | `HORMONAI_RERANK_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder reranker. Recommended: `BAAI/bge-reranker-v2-m3`. |
 | `HORMONAI_RERANK_TOP_N` | `20` | Rerank only the top-N fused candidates. Lower is faster (esp. a large reranker on CPU); higher gives a little more recall. |
+| `HORMONAI_RETRIEVAL_SCOPE` | `shared` (GUI) | Language scope of retrieval. `shared` = combined `kb_all` index with same-language-first + cross-lingual fallback. `language` = search only the query-language corpus (`kb_<lang>`), no cross-lingual fallback. Equivalent CLI flag: `--retrieval-scope`. |
 | `HORMONAI_RERANK_THRESHOLD` | `-1.0` | Accept threshold on the reranker score (when reranking is on). Model-specific — calibrate. |
 | `HORMONAI_SEM_THRESHOLD` | `0.62` | Dense-cosine accept threshold (used when reranking is off). |
 | `HORMONAI_DENSE_FLOOR` | `0.50` | Cosine floor for the high-IDF lexical safety net. |
 | `HORMONAI_LLM_MODEL` | `llama3.2` | Ollama model used for grounded rephrasing (`--use-llm`). |
+| `HORMONAI_SHOW_TIMING` | `0` | `1` shows a per-query latency breakdown (retrieve / rerank / llm / total) under each GUI answer. Also enabled by the CLI `--debug` flag. Off by default. |
+| `HORMONAI_AUDIT_LATENCY` | `0` | `1` appends a PHI-free latency record per query (timing + language + answered only, never the raw query) to the audit log for p50/p95 tracking. |
 
 Thresholds are **model-specific starting points, not tuned values**. After any embedding/reranker change, sweep them on the gold set and set the winning values via these env vars. For a patient-facing tool, keep the out-of-scope **false-answer rate at zero** as the hard constraint.
 
@@ -274,5 +305,18 @@ Thresholds are **model-specific starting points, not tuned values**. After any e
 # recalibrate after a model change (watch the FALSE-ANSWER and lead-source-correctness rows)
 python tests/eval_retrieval.py --shared --verbose
 python tests/eval_retrieval.py --shared --rerank-threshold 0     # sweep around the default
+```
+
+### Latency
+
+The reranker is the dominant per-query cost, so it is tunable: `HORMONAI_RERANK_TOP_N`
+caps how many fused candidates are reranked (the main lever), and a smaller
+reranker model or GPU/MPS both help. Turn on `HORMONAI_SHOW_TIMING=1` (or CLI
+`--debug`) to see the retrieve / rerank / llm / total split per query, and
+`HORMONAI_AUDIT_LATENCY=1` to log those numbers. Aggregate them into p50/p95/p99:
+
+```bash
+python tools/latency_report.py                 # percentiles per stage from the audit log
+python tools/latency_report.py --answered-only --lang en
 ```
 
