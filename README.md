@@ -129,6 +129,38 @@ The recommended stack is **BGE-M3** embeddings with the matched **bge-reranker-v
 
 > Both are loaded via `sentence-transformers` and download large models on first use (BGE-M3 ~2.3GB, bge-reranker-v2-m3 ~2.3GB); they are much faster on GPU. Changing the embedding model requires a fresh ingest. Changing **either** model changes the score scale, so re-calibrate the gate thresholds (below) against the gold eval set afterward.
 
+#### Where the models run (local, no inference API)
+
+Retrieval (dense embeddings) and reranking run **locally, in-process**, through
+the `sentence-transformers` / PyTorch library. There is **no external or cloud
+inference API**: `HORMONAI_EMBEDDING_MODEL` and `HORMONAI_RERANK_MODEL` name a
+model that is downloaded **once** from the Hugging Face Hub and cached (default
+`~/.cache/huggingface`), after which every query is computed on your own machine
+(CPU, or GPU/MPS if available). BM25 is pure local Python. The only other model,
+the optional LLM used for `--use-llm` rephrasing, runs in your local Ollama
+server, not a cloud service.
+
+**Using a locally installed model.** Because these settings accept a filesystem
+path as well as a Hub id, point them at a local model directory to run without
+contacting the Hub at all:
+
+```bash
+export HORMONAI_EMBEDDING_MODEL="/models/bge-m3"              # local directory, not a Hub id
+export HORMONAI_RERANK_MODEL="/models/bge-reranker-v2-m3"
+# equivalently: python chatbot.py --embedding-model /models/bge-m3 --rerank-model /models/bge-reranker-v2-m3
+```
+
+To guarantee fully offline behavior (never reach the Hub, even to check the
+cache), also set the standard Hugging Face flags:
+
+```bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
+
+The embedding model still has to match the one used at ingestion (the loader
+checks the output dimension against the FAISS index and refuses a mismatch).
+
 ### Check PDF extraction fidelity (recommended before ingesting)
 
 PDF extraction is the weakest link, and for a medical tool a garbled number or a dropped "not" is a safety issue. This script reports per-source extraction health (backend, pages, chars/page, chunk count, and a scanned/thin/ok flag) and, with `--preview`, prints the cleaned head/tail and first chunk so wording and numbers can be spot-checked. It exits non-zero if any PDF looks scanned/empty (no text layer, needs OCR or a cleaner source).
@@ -186,7 +218,7 @@ python ingest_faq.py -l en -d corpus/en/20250613_FAQ_Hormono_EN.docx
 python ingest_faq.py -l fr -d corpus/fr/20250613_FAQ_Hormono_FR.docx
 
 # optional: question paraphrase augmentation (requires Ollama at http://localhost:11434)
-python ingest_faq.py -l en --augment-questions --paraphrase-n 6 -d corpus/en/20250613_FAQ_Hormono_EN.docx
+python ingest_faq.py -l en --augment-questions --paraphrase-n 6 -d corpus/en/FAQ_Hormono_EN.docx
 ```
 
 ## Evaluate retrieval + gating
@@ -212,9 +244,33 @@ python chatbot.py -l fr --shared
 `-l` selects the active query language; the shared index answers in that
 language when possible and falls back cross-lingual with a notice otherwise.
 
+## LLM backend (Ollama) — required only for LLM rephrasing
+
+Grounded LLM rephrasing (the CLI `--use-llm` flag and the GUI "LLM rephrasing"
+toggle) needs a local Ollama server. Retrieval and verbatim answers work without
+it; if Ollama is not running, the app simply falls back to the verbatim answer.
+
+1. Install Ollama from https://ollama.com/download (macOS, Linux, or Windows).
+2. Start the server (it also starts automatically after install on macOS/Windows):
+
+```bash
+ollama serve                                   # serves the API on http://localhost:11434
+```
+
+3. Pull the model once (default is llama3.2, a 3B model):
+
+```bash
+ollama pull llama3.2
+curl http://localhost:11434/api/version        # optional: confirm it is up
+```
+
+Override the endpoint with `OLLAMA_HOST` (e.g. `export OLLAMA_HOST=http://localhost:11434`)
+and the model with `HORMONAI_LLM_MODEL` / `--llm-model`. Start Ollama **before**
+launching the CLI or the Streamlit GUI so the LLM toggle has a backend to reach.
+
 ## Run with grounded LLM rephrasing
 ```bash
-python chatbot.py -l en --use-llm   # requires Ollama at http://localhost:11434 (default model: llama3.2)
+python chatbot.py -l en --use-llm   # requires Ollama running (see "LLM backend" above)
 ```
 With `--use-llm`, the answer is rephrased by the LLM using **only** the retrieved
 source text (for clarity and empathy, never adding facts). If the LLM is
@@ -242,6 +298,10 @@ The GUI loads the shared `kb_all_*` index automatically (with same-language
 preference and cross-lingual fallback) and falls back to the per-language
 indexes if `kb_all_*` has not been built.
 
+To use the GUI's "LLM rephrasing" toggle, start Ollama first (see the "LLM
+backend (Ollama)" section above); otherwise the toggle has no effect and answers
+stay verbatim.
+
 To search only the corpus in the query's language (for example, English
 questions answered from the English corpus only, with no cross-lingual
 fallback):
@@ -251,10 +311,13 @@ export HORMONAI_EMBEDDING_MODEL="BAAI/bge-m3"
 export HORMONAI_RERANK_MODEL="BAAI/bge-reranker-v2-m3"
 streamlit run hormonai_app.py -- --retrieval-scope language
 ```
-The GUI defaults to `shared` (combined index, cross-lingual fallback) so current
-behavior is unchanged unless `language` is requested. Language-only mode uses the
-per-language `kb_<lang>` index, which ingestion builds by default (unless run with
-`--no-per-language`); if it is missing, the app falls back to the shared index.
+Retrieval scope is an operator-only setting, configured at launch via
+`--retrieval-scope` or `HORMONAI_RETRIEVAL_SCOPE` (there is no patient-facing
+control for it). The GUI defaults to `shared` (combined index, cross-lingual
+fallback) so current behavior is unchanged unless `language` is requested.
+Language-only mode uses the per-language `kb_<lang>` index, which ingestion
+builds by default (unless run with `--no-per-language`); if it is missing, the
+app falls back to the shared index.
 
 ### Launch with parameters
 
@@ -288,8 +351,8 @@ The CLI, GUI, and eval harness all read these so a calibrated configuration is a
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HORMONAI_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | Dense embedding model. **Must match the model used at ingestion.** |
-| `HORMONAI_RERANK_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder reranker. Recommended: `BAAI/bge-reranker-v2-m3`. |
+| `HORMONAI_EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | Dense embedding model, run locally via sentence-transformers. Accepts a Hugging Face id **or a local directory path**. **Must match the model used at ingestion.** |
+| `HORMONAI_RERANK_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder reranker, run locally. Accepts a Hugging Face id or a local directory path. Recommended: `BAAI/bge-reranker-v2-m3`. |
 | `HORMONAI_RERANK_TOP_N` | `20` | Rerank only the top-N fused candidates. Lower is faster (esp. a large reranker on CPU); higher gives a little more recall. |
 | `HORMONAI_RETRIEVAL_SCOPE` | `shared` (GUI) | Language scope of retrieval. `shared` = combined `kb_all` index with same-language-first + cross-lingual fallback. `language` = search only the query-language corpus (`kb_<lang>`), no cross-lingual fallback. Equivalent CLI flag: `--retrieval-scope`. |
 | `HORMONAI_RERANK_THRESHOLD` | `-1.0` | Accept threshold on the reranker score (when reranking is on). Model-specific — calibrate. |

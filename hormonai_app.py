@@ -619,6 +619,10 @@ use_rerank = st.sidebar.checkbox(
     help=use_rerank_help,
 )
 
+# Language scope is an operator-only setting (launch flag / env), never a
+# patient-facing control. It is fixed for the session from RETRIEVAL_SCOPE.
+active_scope = RETRIEVAL_SCOPE
+
 show_sources = st.sidebar.checkbox(
     show_sources_label,
     value=True,
@@ -654,7 +658,7 @@ def load_perlang_retriever(lang: str, rerank: bool) -> HybridFAQRetriever:
 
 retriever = None
 retrieval_mode = None
-if RETRIEVAL_SCOPE == "language":
+if active_scope == "language":
     # Language-only: search just the query-language corpus (kb_<lang>). No
     # cross-lingual fallback. If that index is missing, fall back to the shared
     # index so the app still answers.

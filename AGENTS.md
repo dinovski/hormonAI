@@ -55,6 +55,12 @@ This document provides guidance for AI coding assistants (such as Claude, GitHub
 
 ## Retrieval Architecture
 
+> **Models run locally.** Embeddings (`SentenceTransformer`) and the reranker
+> (`CrossEncoder`) execute in-process via `sentence-transformers`/PyTorch; there
+> is no external inference API. The model setting accepts a Hugging Face id or a
+> local directory path (set `HF_HUB_OFFLINE=1` for fully offline use). The
+> optional LLM (`--use-llm`) runs in a local Ollama server.
+
 ### Four-Channel Hybrid Retrieval
 
 The system uses four retrieval channels that are fused together:
