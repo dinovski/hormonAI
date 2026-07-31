@@ -67,9 +67,9 @@ The decision to answer or abstain is **semantic-first**: the primary signal is t
 ├── ingest_faq.py          # Legacy FAQ-only ingestion (still supported)
 ├── rag_core.py            # Core RAG logic (retriever, IDF anchors, semantic-first gate, cross-lingual fallback)
 ├── chatbot.py             # Command-line chatbot
-├── hormonai_app.py        # Streamlit GUI (chat assistant shown as "Mona")
+├── hormonai_app.py        # Streamlit GUI
 ├── audit_logger.py        # Query logger
-├── manifest.json          # Ingestion manifest (FAQ + articles, EN + FR)
+├── manifest.json          # Ingestion manifest (document, type, lang)
 ├── RETRIEVAL_REVIEW.md    # Retrieval design notes and change log
 ├── hormonAI.png           # Logo (used by the GUI)
 ├── data/                  # Generated indexes
@@ -84,8 +84,8 @@ The decision to answer or abstain is **semantic-first**: the primary signal is t
 ├── tools/                 # Operational helpers
 │   └── latency_report.py  # p50/p95/p99 latency from the audit log
 ├── corpus/                # Source knowledge base (FAQ + articles), by language
-│   ├── en/                # e.g. 20250613_FAQ_Hormono_EN.docx, *.pdf articles
-│   └── fr/                # e.g. 20250613_FAQ_Hormono_FR.docx, *.pdf articles
+│   ├── en/                # e.g. FAQ_Hormono_EN.docx, *.pdf articles
+│   └── fr/                # e.g. FAQ_Hormono_FR.docx, *.pdf articles
 └── README.md
 ```
 
@@ -214,8 +214,8 @@ kb_<lang>_*              # The same five files, per language
 The original FAQ-only pipeline is still supported and is what produced the current per-language indexes. It does not build the shared `kb_all_*` index and does not handle articles.
 
 ```bash
-python ingest_faq.py -l en -d corpus/en/20250613_FAQ_Hormono_EN.docx
-python ingest_faq.py -l fr -d corpus/fr/20250613_FAQ_Hormono_FR.docx
+python ingest_faq.py -l en -d corpus/en/FAQ_Hormono_EN.docx
+python ingest_faq.py -l fr -d corpus/fr/FAQ_Hormono_FR.docx
 
 # optional: question paraphrase augmentation (requires Ollama at http://localhost:11434)
 python ingest_faq.py -l en --augment-questions --paraphrase-n 6 -d corpus/en/FAQ_Hormono_EN.docx
@@ -233,7 +233,7 @@ python tests/eval_retrieval.py --shared --verbose      # evaluate the shared (pr
 
 ## Run hormonAI (CLI)
 ```bash
-python chatbot.py -l en [--debug]
+python chatbot.py -l en --debug
 ```
 CrossEncoder reranking is **on by default** (disable with `--no-rerank`).
 
@@ -270,7 +270,10 @@ launching the CLI or the Streamlit GUI so the LLM toggle has a backend to reach.
 
 ## Run with grounded LLM rephrasing
 ```bash
-python chatbot.py -l en --use-llm   # requires Ollama running (see "LLM backend" above)
+python chatbot.py -l en --debug \
+  --rerank-model BAAI/bge-reranker-v2-m3 \
+  --rerank-threshold 0.2 --rerank-top-n 5 \
+  --use-llm
 ```
 With `--use-llm`, the answer is rephrased by the LLM using **only** the retrieved
 source text (for clarity and empathy, never adding facts). If the LLM is
@@ -375,7 +378,7 @@ python tests/eval_retrieval.py --shared --rerank-threshold 0     # sweep around 
 
 ### Latency
 
-The reranker is the dominant per-query cost, so it is tunable: `HORMONAI_RERANK_TOP_N`
+The reranker is the dominant per-query cost and is tunable: `HORMONAI_RERANK_TOP_N`
 caps how many fused candidates are reranked (the main lever), and a smaller
 reranker model or GPU/MPS both help. Turn on `HORMONAI_SHOW_TIMING=1` (or CLI
 `--debug`) to see the retrieve / rerank / llm / total split per query, and
