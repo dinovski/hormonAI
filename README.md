@@ -145,7 +145,7 @@ path as well as a Hub id, point them at a local model directory to run without
 contacting the Hub at all:
 
 ```bash
-export HORMONAI_EMBEDDING_MODEL="/models/bge-m3"              # local directory, not a Hub id
+export HORMONAI_EMBEDDING_MODEL="/models/bge-m3"
 export HORMONAI_RERANK_MODEL="/models/bge-reranker-v2-m3"
 # equivalently: python chatbot.py --embedding-model /models/bge-m3 --rerank-model /models/bge-reranker-v2-m3
 ```
@@ -274,8 +274,11 @@ python chatbot.py -l en --use-llm   # requires Ollama running (see "LLM backend"
 ```
 With `--use-llm`, the answer is rephrased by the LLM using **only** the retrieved
 source text (for clarity and empathy, never adding facts). If the LLM is
-unreachable, it falls back to the verbatim answer. Without `--use-llm`, the
-retrieved text is quoted verbatim with a fixed empathy line.
+unreachable or returns nothing, it falls back to the verbatim answer, and the
+fallback is made **explicit** rather than silent: the CLI prints a `[notice]`
+to stderr (naming the reason, e.g. Ollama not running) and the GUI shows a short
+warning above the answer. Without `--use-llm`, the retrieved text is quoted
+verbatim with a fixed empathy line.
 
 In both cases the cited sources are kept **out of the answer body**: the GUI
 shows them in the "Sources used for this answer" panel, and the CLI prints them
@@ -329,7 +332,7 @@ tune retrieval without editing code or exporting env vars:
 # rerank fewer candidates (faster) with a stronger reranker, and show a
 # per-query latency breakdown under each answer
 streamlit run hormonai_app.py -- \
-  --rerank-top-n 10 \
+  --rerank-top-n 5 \
   --rerank-model BAAI/bge-reranker-v2-m3 \
   --rerank-threshold 0.2 \
   --debug

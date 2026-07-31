@@ -452,6 +452,13 @@ class AnswerResult:
     source_indices: Optional[List[int]] = None   # positional indices of every bundled source
     sources_text: Optional[str] = None            # formatted citations, kept OUT of answer_text
     timing_ms: Optional[Dict[str, Any]] = None    # per-query latency breakdown (always populated)
+    # LLM rephrasing outcome, so callers can surface a silent fallback:
+    #   None                  -> LLM rephrasing not requested (use_llm=False)
+    #   "used"                -> LLM rephrased the answer
+    #   "fallback_unreachable"-> LLM requested but unreachable; showed verbatim
+    #   "fallback_empty"      -> LLM reachable but returned nothing; showed verbatim
+    llm_status: Optional[str] = None
+    llm_error: Optional[str] = None               # connection/HTTP error detail, when unreachable
     debug: Optional[Dict[str, Any]] = None
 
 
@@ -981,6 +988,10 @@ class LLMWrapperWriter:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
+        # Set by _generate on each call: the connection/HTTP error string if the
+        # local LLM (Ollama) could not be reached, else None. Lets callers report
+        # WHY a rephrase fell back to verbatim instead of failing silently.
+        self.last_error: Optional[str] = None
 
     def _system_prompt(self) -> str:
         if self.language == "fr":
@@ -1107,11 +1118,15 @@ class LLMWrapperWriter:
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        self.last_error = None
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                 out = json.loads(resp.read().decode("utf-8"))
             return (out.get("response") or "").strip()
-        except Exception:
+        except Exception as e:
+            # Record the reason (e.g. connection refused, timeout) so the caller
+            # can surface it. The empty return still triggers verbatim fallback.
+            self.last_error = f"{type(e).__name__}: {e}"
             return ""
 
     def write(self, user_query: str) -> str:
@@ -1544,25 +1559,31 @@ def answer_query(
         prefix = _fallback_empathy(lang, user_query, bundle[0].question)
         return (prefix + notice_block + factual_block).strip()
 
+    llm_status: Optional[str] = None
+    llm_error: Optional[str] = None
     if use_llm:
         # Grounded rephrasing: the LLM rewrites ONLY the retrieved source text for
         # clarity + empathy (no new facts), then the verbatim sources are cited.
         # If the LLM is unreachable/empty, fall back to the verbatim answer so we
-        # never lose a response.
+        # never lose a response -- but record WHY so the CLI/GUI can say so.
         source_text = _bundle_source_text(bundle)
         _t_llm = time.perf_counter()
-        rephrased = LLMWrapperWriter(language=lang, model=llm_model).rephrase(
-            user_query=user_query, source_text=source_text
-        ).strip()
+        writer = LLMWrapperWriter(language=lang, model=llm_model)
+        rephrased = writer.rephrase(user_query=user_query, source_text=source_text).strip()
         timing["llm"] = (time.perf_counter() - _t_llm) * 1000.0
         if rephrased:
             answer_text = (notice_block + rephrased).strip()
+            llm_status = "used"
             if debug:
                 dbg["llm_mode"] = "rephrase"
         else:
+            # Distinguish "could not reach the LLM" from "LLM returned nothing".
             answer_text = _verbatim_answer()
+            llm_error = writer.last_error
+            llm_status = "fallback_unreachable" if writer.last_error else "fallback_empty"
             if debug:
                 dbg["llm_mode"] = "verbatim_fallback"
+                dbg["llm_error"] = writer.last_error
     else:
         answer_text = _verbatim_answer()
         if debug:
@@ -1586,6 +1607,8 @@ def answer_query(
         source_indices=[c.index for c in bundle],
         sources_text=sources,
         timing_ms=timing,
+        llm_status=llm_status,
+        llm_error=llm_error,
         debug=(dbg if debug else None),
     )
 

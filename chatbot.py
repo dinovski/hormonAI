@@ -14,6 +14,7 @@ Key rules:
 from __future__ import annotations
 
 import os
+import sys
 import argparse
 
 from rag_core import HybridFAQRetriever, answer_query, print_debug
@@ -54,8 +55,8 @@ def parse_args() -> argparse.Namespace:
                         "'language' = search only the query-language corpus. "
                         "Overrides --shared; env: HORMONAI_RETRIEVAL_SCOPE.")
     p.add_argument("--rerank-top-n", type=int,
-                   default=int(os.getenv("HORMONAI_RERANK_TOP_N", "20")),
-                   help="Rerank only the top-N fused candidates (lower = faster; default 20).")
+                   default=int(os.getenv("HORMONAI_RERANK_TOP_N", "5")),
+                   help="Rerank only the top-N fused candidates (lower = faster; default 5).")
 
     # Gate tuning (calibrate on tests/eval_set.jsonl for the deployed models).
     # Semantic-first: rerank score is primary when --rerank is on, else dense cosine.
@@ -154,6 +155,17 @@ def main() -> None:
             timing_ms=result.timing_ms,
             meta=(result.debug if args.debug else None),
         )
+
+        # Make an LLM rephrasing fallback explicit instead of silent: the answer
+        # is the verbatim source text because the LLM could not be used.
+        if result.llm_status in ("fallback_unreachable", "fallback_empty"):
+            if result.llm_status == "fallback_unreachable":
+                reason = (f"could not reach the LLM ({result.llm_error}); "
+                          f"is Ollama running at {os.getenv('OLLAMA_HOST', 'http://localhost:11434')}?")
+            else:
+                reason = "the LLM returned nothing"
+            print(f"[notice] LLM rephrasing requested but {reason} "
+                  f"Showing the verbatim source answer instead.", file=sys.stderr)
 
         print("\nBot:", result.answer_text, "\n")
         # Sources are kept out of the answer body (the GUI shows them in a

@@ -501,7 +501,7 @@ language = st.sidebar.selectbox(
 
 # ---------- LANGUAGE-SPECIFIC TEXT ----------
 if language == "fr":
-    subtitle_text = "Prototype de chatbot de soutien pour le cancer du sein"
+    subtitle_text = ""
     expander_label = "À propos d’hormonAI & sécurité"
     about_md = """
 <div class="about-text">
@@ -543,7 +543,7 @@ Discutez toujours de votre situation et de toute décision thérapeutique direct
     )
     sample_prompts_label = "Vous ne savez pas comment formuler votre question ? Essayez l’une de celles-ci :"
 else:
-    subtitle_text = "A breast cancer support chatbot prototype"
+    subtitle_text = ""
     expander_label = "About hormonAI & safety"
     about_md = """
 <div class="about-text">
@@ -805,12 +805,30 @@ def handle_send():
                 t.get("llm", 0.0), t.get("total", 0.0),
             )
 
+    # Make an LLM rephrasing fallback explicit instead of silent. When the user
+    # enabled rephrasing but the local LLM was unreachable or returned nothing,
+    # tell them the standard (verbatim) answer is being shown.
+    llm_notice = None
+    status = getattr(res, "llm_status", None) if res is not None else None
+    if use_llm and status in ("fallback_unreachable", "fallback_empty"):
+        if language == "fr":
+            reason = ("n’a pas pu être contacté" if status == "fallback_unreachable"
+                      else "n’a rien renvoyé")
+            llm_notice = (f"Remarque : l’assistant de reformulation {reason}. "
+                          "La réponse standard de la base de connaissances est affichée.")
+        else:
+            reason = ("could not be reached" if status == "fallback_unreachable"
+                      else "returned nothing")
+            llm_notice = (f"Note: the rephrasing assistant {reason}. "
+                          "The standard answer from the knowledge base is shown.")
+
     st.session_state.history.append(
         {
             "role": "bot",
             "content": answer_text,
             "sources": (sources_summary if answered else []),
             "timing": timing_str,
+            "llm_notice": llm_notice,
         }
     )
 
@@ -863,6 +881,9 @@ with chat_container:
             </div>
             """
             st.markdown(bot_html, unsafe_allow_html=True)
+
+            if msg.get("llm_notice"):
+                st.warning(msg["llm_notice"])
 
             if SHOW_TIMING and msg.get("timing"):
                 st.caption(f"⏱ {msg['timing']}")
